@@ -125,17 +125,15 @@ static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data);
 static bool touchpad_is_pressed(void);
 static void touchpad_get_xy(lv_coord_t * x, lv_coord_t * y);
 
-
-#if 0
 static void keypad_init(void);
 static void keypad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data);
 static uint32_t keypad_get_key(void);
-#endif
 /**********************
  *  STATIC VARIABLES
  **********************/
 lv_indev_t * indev_touchpad;
 lv_indev_t * indev_keypad;
+static lv_group_t * g_default_key_group = NULL;
 /**********************
  *      MACROS
  **********************/
@@ -146,19 +144,8 @@ lv_indev_t * indev_keypad;
 
 void lv_port_indev_init(void)
 {
-    /**
-     * Here you will find example implementation of input devices supported by LittelvGL:
-     *  - Touchpad
-     *  - Mouse (with cursor support)
-     *  - Keypad (supports GUI usage only with key)
-     *  - Encoder (supports GUI usage only with: left, right, push)
-     *  - Button (external buttons to press points on the screen)
-     *
-     *  The `..._read()` function are only examples.
-     *  You should shape them according to your hardware
-     */
-
     static lv_indev_drv_t indev_drv;
+    static lv_indev_drv_t keypad_drv;
     
     /*------------------
      * Touchpad
@@ -173,10 +160,20 @@ void lv_port_indev_init(void)
     indev_drv.read_cb = touchpad_read;
     indev_touchpad = lv_indev_drv_register(&indev_drv);
     
-    
-    
-    
-    
+    /*------------------
+     * Physical QWERTY Keypad (TCA8418 on I2C4, auto-detected)
+     * -----------------*/
+    keypad_init();
+    lv_indev_drv_init(&keypad_drv);
+    keypad_drv.type = LV_INDEV_TYPE_KEYPAD;
+    keypad_drv.read_cb = keypad_read;
+    indev_keypad = lv_indev_drv_register(&keypad_drv);
+
+    g_default_key_group = lv_group_create();
+    if (g_default_key_group != NULL) {
+        lv_group_set_default(g_default_key_group);
+        lv_indev_set_group(indev_keypad, g_default_key_group);
+    }
 }
 
 /**********************
@@ -282,7 +279,7 @@ static void touchpad_get_xy(lv_coord_t * x, lv_coord_t * y)
     (*x) = cached_touch_x;
     (*y) = cached_touch_y;
 }
-#if 0
+#if 1
 
 /*------------------
  * Keypad
@@ -291,22 +288,29 @@ static void touchpad_get_xy(lv_coord_t * x, lv_coord_t * y)
 /*Initialize your keypad*/
 static void keypad_init(void)
 {
-    /*Your code comes here*/
-    tca8418_init(); 
-    control_keyboard_backlight(20000,5);
+    tca8418_init();
+    if (tca8418_is_connected()) {
+        control_keyboard_backlight(20000, 5);
+    }
 }
 
-/*Will be called by the library to read the mouse*/
+/*Will be called by the library to read the keypad*/
 static void keypad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
 {
+    (void)indev_drv;
     static uint32_t last_key = 0;
 
-    /*Get the current x and y coordinates*/
-    //mouse_get_xy(&data->point.x, &data->point.y);
-     touchpad_get_xy(&data->point.x, &data->point.y);
-    /*Get whether the a key is pressed and save the pressed key*/
-    uint32_t act_key =keypad_get_key();
+    touchpad_get_xy(&data->point.x, &data->point.y);
+    /*Get whether a key is pressed and save the pressed key*/
+    uint32_t act_key = keypad_get_key();
     if(act_key != 0) {
+        lexios_notify_user_activity();
+        if (lexios_is_screen_asleep()) {
+            lexios_set_screen_sleep(false);
+            data->state = LV_INDEV_STATE_REL;
+            data->key = 0;
+            return;
+        }
         data->state = LV_INDEV_STATE_PR;
 
         /*Translate the keys to LVGL control characters according to your key definitions*/
@@ -364,9 +368,7 @@ static void keypad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
 /*Get the currently being pressed key.  0 if no key is pressed*/
 static uint32_t keypad_get_key(void)
 {
-    /*Your code comes here*/   
-return tca8418_get_key();
-    //return 0;
+    return tca8418_get_key();
 }
 
 #endif

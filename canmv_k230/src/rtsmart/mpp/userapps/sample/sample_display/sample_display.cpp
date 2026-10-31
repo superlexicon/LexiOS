@@ -66,6 +66,7 @@ static volatile bool g_screen_asleep = false;
 static volatile int g_sleep_timeout_sec = 60; // Default 60s inactivity -> Pocket Standby
 static volatile long g_last_activity_sec = 0;
 static volatile long g_boot_time_sec = 0;
+static volatile bool g_nrf9151_power_on = false;
 
 extern "C" void disp_enable_update(void);
 extern "C" void disp_disable_update(void);
@@ -231,6 +232,48 @@ extern "C" uint64_t lexios_get_uptime_sec(void) {
     if (g_boot_time_sec == 0) g_boot_time_sec = now;
     long diff = now - g_boot_time_sec;
     return diff > 0 ? (uint64_t)diff : 0ULL;
+}
+
+extern "C" bool lexios_get_nrf9151_power(void) {
+    return g_nrf9151_power_on;
+}
+
+extern "C" void lexios_set_nrf9151_power(bool enable) {
+    if (gpio_fd <= 0) {
+        gpio_fd = open("/dev/gpio", O_RDWR);
+    }
+    if (enable) {
+        // 1. Power ON nRF9151 3.3V rail on GPIO2 first
+        fpioa_set_function(2, GPIO2, -1, -1, -1, -1, -1, -1, -1);
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_2 = {.pin = 2, .val = 1};
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_2);
+            ioctl(gpio_fd, GPIO_WRITE_HIGH, &pin_2);
+        }
+        // 2. Allow 150ms for nRF9151 SiP voltage rail stabilization before muxing UART2
+        usleep(150000);
+        fpioa_set_function(5, UART2_TXD, -1, -1, -1, -1, -1, -1, -1);
+        fpioa_set_function(6, UART2_RXD, -1, -1, -1, -1, -1, -1, -1);
+        g_nrf9151_power_on = true;
+        printf("[LexiOS-SAT] Powered ON nRF9151 (GPIO2 HIGH) & muxed GPIO5/6 -> UART2 (115200 8N1)\n");
+    } else {
+        // 1. Lock GPIO5 HIGH as GPIO output so LR2021 NRESET cannot be dragged low while nRF9151 is unpowered
+        fpioa_set_function(5, GPIO5, -1, -1, -1, -1, -1, -1, -1);
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_5 = {.pin = 5, .val = 1};
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_5);
+            ioctl(gpio_fd, GPIO_WRITE_HIGH, &pin_5);
+        }
+        // 2. Power OFF nRF9151 3.3V rail on GPIO2
+        fpioa_set_function(2, GPIO2, -1, -1, -1, -1, -1, -1, -1);
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_2 = {.pin = 2, .val = 0};
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_2);
+            ioctl(gpio_fd, GPIO_WRITE_LOW, &pin_2);
+        }
+        g_nrf9151_power_on = false;
+        printf("[LexiOS-SAT] Powered OFF nRF9151 (GPIO2 LOW) & locked GPIO5 HIGH for LR2021\n");
+    }
 }
 
 extern "C" void lexios_set_screen_sleep(bool sleep_mode) {
@@ -766,6 +809,10 @@ void user_gui_init()
     LexiChatApp *app_lexichat = new LexiChatApp();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexichat, "Create app lexichat failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexichat) >= 0), "Install app lexichat failed");
+
+    LexiSatApp *app_lexisat = new LexiSatApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexisat, "Create app lexisat failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexisat) >= 0), "Install app lexisat failed");
 
     LexiAppsApp *app_lexiapps = new LexiAppsApp();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexiapps, "Create app lexiapps failed");

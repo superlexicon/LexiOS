@@ -1,4 +1,5 @@
 #include "lexios_apps.hpp"
+#include "keyboard_ext.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -8,14 +9,17 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
+#include <pthread.h>
 #include <time.h>
 
 extern "C" {
 LV_IMG_DECLARE(img_app_battery);
 LV_IMG_DECLARE(img_app_live_call);
+LV_IMG_DECLARE(img_app_gnss);
 LV_IMG_DECLARE(img_app_object_detect);
 }
 
@@ -101,9 +105,13 @@ static void update_lexisystem_ui(void)
 
     const char *lr_state = (tlevel >= 2) ? "CUTOFF (0 mW)" :
                            (tlevel == 1) ? "THROTTLED (+4 dBm)" : "ACTIVE (<=+10 dBm)";
+    bool nrf_on = lexios_get_nrf9151_power();
+    bool kb_on = tca8418_is_connected();
     snprintf(buf, sizeof(buf),
-             "LR2021 Radio: %s\nnRF9151 Modem: OFF (Power-Gated)\nKPU / DPU / VPU: OFF (Power-Gated)\nKernel RNG: /dev/urandom + getrandom OK",
-             lr_state);
+             "LR2021 Radio: %s\nnRF9151 Sat/GNSS: %s\nQWERTY Keyboard: %s\nKPU / DPU / VPU: OFF (Power-Gated)",
+             lr_state,
+             nrf_on ? "ON (UART2 115200 8N1)" : "OFF (0mW Power-Gated)",
+             kb_on ? "CONNECTED (I2C4 0x34)" : "DETACHED (Hot-Plug Ready)");
     lv_label_set_text(g_sys_rf_lbl, buf);
 
     snprintf(buf, sizeof(buf), "LexiOS v1.0  •  Uptime: %lluh %llum %llus",
@@ -523,6 +531,10 @@ bool LexiChatApp::run(void)
     lv_obj_align(g_chat_input_ta, LV_ALIGN_TOP_LEFT, 16, 510);
     lv_textarea_set_one_line(g_chat_input_ta, true);
     lv_textarea_set_placeholder_text(g_chat_input_ta, "Type mesh message...");
+    if (lv_group_get_default() != nullptr) {
+        lv_group_add_obj(lv_group_get_default(), g_chat_input_ta);
+        lv_group_focus_obj(g_chat_input_ta);
+    }
 
     lv_obj_t *send_btn = create_action_btn(root, "SEND", 112, 56, 0x16A34A);
     lv_obj_align(send_btn, LV_ALIGN_TOP_RIGHT, -16, 510);
@@ -759,3 +771,541 @@ bool LexiAppsApp::close(void)
 }
 
 bool LexiAppsApp::init(void) { return true; }
+
+/* ============================================================================
+ * 4. LexiSatApp — nRF9151 Satellite NTN (3GPP Rel-17), GNSS/GPS & QWERTY Hub
+ * ============================================================================ */
+#define LEXISAT_IOC_SET_BAUDRATE _IOW('U', 0x40, int)
+struct lexisat_uart_cfg {
+    uint32_t baud_rate;
+    uint32_t data_bits   : 4;
+    uint32_t stop_bits   : 2;
+    uint32_t parity      : 2;
+    uint32_t fifo_lenth  : 2;
+    uint32_t auto_flow   : 1;
+    uint32_t reserved    : 21;
+};
+
+static int g_sat_uart_fd = -1;
+static pthread_mutex_t g_sat_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool g_sat_worker_started = false;
+static volatile int g_sat_pending_op = 0; // 1=query_id, 2=mode_ntn, 3=mode_gnss, 4=mode_ltem, 5=custom_at
+static char g_sat_custom_cmd[256] = {0};
+
+static char g_sat_mode_str[32] = "STANDBY (OFF)";
+static char g_sat_imei[32] = "--";
+static char g_sat_iccid[32] = "--";
+static char g_sat_fw[32] = "--";
+static char g_sat_cereg[32] = "Unregistered";
+static char g_sat_lat[24] = "--";
+static char g_sat_lon[24] = "--";
+static char g_sat_alt[24] = "--";
+static char g_sat_speed[24] = "--";
+static char g_sat_utc[32] = "-- (Wait Fix)";
+static char g_sat_rx_log[512] =
+    "[LexiSat] Nordic nRF9151 SiP (3GPP Rel-17 NTN Satellite / GNSS / LTE-M)\n"
+    "[LexiSat] Tap 'nRF9151 ON' to power GPIO2 & attach /dev/uart2.";
+
+static int g_kb_backlight_idx = 1; // 0=OFF(0%), 1=Low(5%), 2=High(25%)
+
+static lv_obj_t *g_sat_hdr_lbl = nullptr;
+static lv_obj_t *g_sat_gnss_lbl = nullptr;
+static lv_obj_t *g_sat_log_lbl = nullptr;
+static lv_obj_t *g_sat_input_ta = nullptr;
+
+static void sat_append_log(const char *line)
+{
+    if (!line || !line[0]) return;
+    pthread_mutex_lock(&g_sat_lock);
+    size_t cur_len = strlen(g_sat_rx_log);
+    if (cur_len > 340) {
+        const char *nl = strchr(g_sat_rx_log + 100, '\n');
+        if (nl) {
+            memmove(g_sat_rx_log, nl + 1, strlen(nl + 1) + 1);
+        } else {
+            g_sat_rx_log[0] = '\0';
+        }
+    }
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s\n%s", g_sat_rx_log, line);
+    snprintf(g_sat_rx_log, sizeof(g_sat_rx_log), "%s", tmp);
+    pthread_mutex_unlock(&g_sat_lock);
+}
+
+static bool sat_ensure_uart_open(void)
+{
+    if (!lexios_get_nrf9151_power()) {
+        if (g_sat_uart_fd > 0) {
+            close(g_sat_uart_fd);
+            g_sat_uart_fd = -1;
+        }
+        return false;
+    }
+    if (g_sat_uart_fd > 0) {
+        return true;
+    }
+    int fd = open("/dev/uart2", O_RDWR | O_NONBLOCK);
+    if (fd <= 0) {
+        return false;
+    }
+    struct lexisat_uart_cfg cfg = {
+        .baud_rate = 115200,
+        .data_bits = 8,
+        .stop_bits = 1,
+        .parity = 0,
+        .fifo_lenth = 2,
+        .auto_flow = 0,
+        .reserved = 0
+    };
+    ioctl(fd, LEXISAT_IOC_SET_BAUDRATE, &cfg);
+    g_sat_uart_fd = fd;
+    return true;
+}
+
+static void sat_parse_line(const char *line)
+{
+    if (!line || !line[0]) return;
+    if (strcmp(line, "OK") == 0) return;
+
+    pthread_mutex_lock(&g_sat_lock);
+    if (strncmp(line, "#XGPS:", 6) == 0 && strlen(line) > 12) {
+        /* Format: #XGPS: <lat>,<lon>,<alt>,<acc>,<speed>,<heading>,"YYYY-MM-DD HH:MM:SS" */
+        char copy[160];
+        snprintf(copy, sizeof(copy), "%s", line + 6);
+        char *save = nullptr;
+        char *tok = strtok_r(copy, ",", &save);
+        int idx = 0;
+        while (tok != nullptr) {
+            while (*tok == ' ') tok++;
+            if (idx == 0) snprintf(g_sat_lat, sizeof(g_sat_lat), "%s", tok);
+            else if (idx == 1) snprintf(g_sat_lon, sizeof(g_sat_lon), "%s", tok);
+            else if (idx == 2) snprintf(g_sat_alt, sizeof(g_sat_alt), "%s m", tok);
+            else if (idx == 4) snprintf(g_sat_speed, sizeof(g_sat_speed), "%s m/s", tok);
+            else if (idx == 6) {
+                /* Strip quotes and sync system RTC */
+                if (tok[0] == '"') tok++;
+                size_t l = strlen(tok);
+                if (l > 0 && tok[l - 1] == '"') tok[l - 1] = '\0';
+                snprintf(g_sat_utc, sizeof(g_sat_utc), "%s UTC", tok);
+                int y = 0, m = 0, d = 0, hh = 0, mm = 0, ss = 0;
+                if (sscanf(tok, "%d-%d-%d %d:%d:%d", &y, &m, &d, &hh, &mm, &ss) == 6 && y >= 2024) {
+                    struct tm tmv;
+                    memset(&tmv, 0, sizeof(tmv));
+                    tmv.tm_year = y - 1900;
+                    tmv.tm_mon = m - 1;
+                    tmv.tm_mday = d;
+                    tmv.tm_hour = hh;
+                    tmv.tm_min = mm;
+                    tmv.tm_sec = ss;
+                    time_t epoch = mktime(&tmv);
+                    if (epoch > 0) {
+                        struct timespec ts = {.tv_sec = epoch, .tv_nsec = 0};
+                        clock_settime(CLOCK_REALTIME, &ts);
+                    }
+                }
+            }
+            tok = strtok_r(nullptr, ",", &save);
+            idx++;
+        }
+    } else if (strstr(line, "%XICCID:") != nullptr) {
+        const char *p = strchr(line, ':');
+        if (p) {
+            p++;
+            while (*p == ' ') p++;
+            snprintf(g_sat_iccid, sizeof(g_sat_iccid), "%s", p);
+        }
+    } else if (strstr(line, "mfw_") != nullptr) {
+        snprintf(g_sat_fw, sizeof(g_sat_fw), "%s", line);
+    } else if (strncmp(line, "+CEREG:", 7) == 0) {
+        snprintf(g_sat_cereg, sizeof(g_sat_cereg), "%s", line + 7);
+    } else if (strlen(line) == 15 && line[0] >= '0' && line[0] <= '9') {
+        snprintf(g_sat_imei, sizeof(g_sat_imei), "%s", line);
+    }
+    pthread_mutex_unlock(&g_sat_lock);
+
+    char log_entry[160];
+    snprintf(log_entry, sizeof(log_entry), "RX < %s", line);
+    sat_append_log(log_entry);
+}
+
+static void sat_send_at(const char *cmd, int wait_ms)
+{
+    if (!sat_ensure_uart_open()) return;
+    char full[280];
+    snprintf(full, sizeof(full), "%s\r\n", cmd);
+    write(g_sat_uart_fd, full, strlen(full));
+
+    char log_entry[160];
+    snprintf(log_entry, sizeof(log_entry), "TX > %s", cmd);
+    sat_append_log(log_entry);
+
+    int loops = (wait_ms > 0 ? wait_ms : 200) / 40;
+    if (loops < 1) loops = 1;
+    char rx_buf[512];
+    for (int i = 0; i < loops; i++) {
+        usleep(40000);
+        int n = read(g_sat_uart_fd, rx_buf, sizeof(rx_buf) - 1);
+        if (n > 0) {
+            rx_buf[n] = '\0';
+            char *save = nullptr;
+            char *line = strtok_r(rx_buf, "\r\n", &save);
+            while (line != nullptr) {
+                sat_parse_line(line);
+                line = strtok_r(nullptr, "\r\n", &save);
+            }
+        }
+    }
+}
+
+static void *sat_uart_worker_thread(void *arg)
+{
+    (void)arg;
+    char rx_buf[512];
+    while (1) {
+        int op = g_sat_pending_op;
+        if (op != 0) {
+            g_sat_pending_op = 0;
+            if (!lexios_get_nrf9151_power()) {
+                lexios_set_nrf9151_power(true);
+                pthread_mutex_lock(&g_sat_lock);
+                snprintf(g_sat_mode_str, sizeof(g_sat_mode_str), "POWERED ON");
+                pthread_mutex_unlock(&g_sat_lock);
+            }
+            if (op == 1) {
+                /* Query Modem ID & Registration */
+                sat_send_at("AT+CGMR", 250);
+                sat_send_at("AT+CGSN", 250);
+                sat_send_at("AT%XICCID", 250);
+                sat_send_at("AT+CEREG?", 250);
+            } else if (op == 2) {
+                /* 3GPP Rel-17 Satellite NTN NB-IoT Mode */
+                pthread_mutex_lock(&g_sat_lock);
+                snprintf(g_sat_mode_str, sizeof(g_sat_mode_str), "SAT-NTN (3GPP Rel-17)");
+                pthread_mutex_unlock(&g_sat_lock);
+                sat_send_at("AT#XGPS=0", 250);
+                sat_send_at("AT+CFUN=0", 400);
+                sat_send_at("AT%XSYSTEMMODE=0,0,0,0,1", 400);
+                sat_send_at("AT+CEREG=5", 250);
+                sat_send_at("AT+CFUN=1", 500);
+                sat_send_at("AT+CEREG?", 300);
+            } else if (op == 3) {
+                /* GNSS / GPS Positioning Mode */
+                pthread_mutex_lock(&g_sat_lock);
+                snprintf(g_sat_mode_str, sizeof(g_sat_mode_str), "GNSS (GPS Active)");
+                pthread_mutex_unlock(&g_sat_lock);
+                sat_send_at("AT#XGPS=0", 300);
+                sat_send_at("AT+CFUN=0", 400);
+                sat_send_at("AT%XSYSTEMMODE=0,0,1,0", 400);
+                sat_send_at("AT+CFUN=31", 400);
+                sat_send_at("AT#XGPS=1,0,0,0", 400);
+            } else if (op == 4) {
+                /* LTE-M + GNSS Concurrent Mode */
+                pthread_mutex_lock(&g_sat_lock);
+                snprintf(g_sat_mode_str, sizeof(g_sat_mode_str), "LTE-M + GNSS");
+                pthread_mutex_unlock(&g_sat_lock);
+                sat_send_at("AT+CFUN=0", 400);
+                sat_send_at("AT%XSYSTEMMODE=1,0,1,0", 400);
+                sat_send_at("AT+CEREG=5", 250);
+                sat_send_at("AT+CFUN=1", 400);
+                sat_send_at("AT#XGPS=1,0,0,0", 400);
+            } else if (op == 5) {
+                char cmd_copy[256];
+                pthread_mutex_lock(&g_sat_lock);
+                snprintf(cmd_copy, sizeof(cmd_copy), "%s", g_sat_custom_cmd);
+                pthread_mutex_unlock(&g_sat_lock);
+                if (cmd_copy[0]) {
+                    sat_send_at(cmd_copy, 350);
+                }
+            }
+        }
+
+        /* Background non-blocking poll for unsolicited #XGPS: / +CEREG: sentences */
+        if (sat_ensure_uart_open()) {
+            int n = read(g_sat_uart_fd, rx_buf, sizeof(rx_buf) - 1);
+            if (n > 0) {
+                rx_buf[n] = '\0';
+                char *save = nullptr;
+                char *line = strtok_r(rx_buf, "\r\n", &save);
+                while (line != nullptr) {
+                    sat_parse_line(line);
+                    line = strtok_r(nullptr, "\r\n", &save);
+                }
+            }
+        }
+        usleep(100000);
+    }
+    return nullptr;
+}
+
+static void refresh_lexisat_ui(void)
+{
+    if (!g_sat_hdr_lbl) return;
+    bool nrf_on = lexios_get_nrf9151_power();
+    bool kb_on = tca8418_is_connected();
+    const char *kb_light = (g_kb_backlight_idx == 0) ? "OFF" :
+                           (g_kb_backlight_idx == 1) ? "Low (5%)" : "High (25%)";
+
+    char buf[512];
+    pthread_mutex_lock(&g_sat_lock);
+    snprintf(buf, sizeof(buf),
+             "nRF9151: %s  |  Mode: %s\n"
+             "QWERTY KB (I2C4 0x34): %s  |  Backlight: %s",
+             nrf_on ? "ON (3.3V GPIO2)" : "OFF (0mW Standby)",
+             nrf_on ? g_sat_mode_str : "STANDBY",
+             kb_on ? "CONNECTED" : "DETACHED",
+             kb_light);
+    lv_label_set_text(g_sat_hdr_lbl, buf);
+
+    if (g_sat_gnss_lbl) {
+        snprintf(buf, sizeof(buf),
+                 "GPS Fix   : Lat %s  |  Lon %s\n"
+                 "Kinematics: Alt %s  |  Speed %s  |  %s\n"
+                 "Modem ID  : IMEI %s  |  FW %s  |  CEREG %s",
+                 g_sat_lat, g_sat_lon,
+                 g_sat_alt, g_sat_speed, g_sat_utc,
+                 g_sat_imei, g_sat_fw, g_sat_cereg);
+        lv_label_set_text(g_sat_gnss_lbl, buf);
+    }
+    if (g_sat_log_lbl) {
+        lv_label_set_text(g_sat_log_lbl, g_sat_rx_log);
+    }
+    pthread_mutex_unlock(&g_sat_lock);
+}
+
+static void sat_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    refresh_lexisat_ui();
+}
+
+static void on_sat_power_toggle_cb(lv_event_t *e)
+{
+    (void)e;
+    bool cur = lexios_get_nrf9151_power();
+    if (cur) {
+        if (g_sat_uart_fd > 0) {
+            write(g_sat_uart_fd, "AT+CFUN=0\r\n", 11);
+            usleep(80000);
+            close(g_sat_uart_fd);
+            g_sat_uart_fd = -1;
+        }
+        lexios_set_nrf9151_power(false);
+        sat_append_log("[LexiSat] Powered OFF nRF9151 (GPIO2 LOW, GPIO5 locked HIGH).");
+    } else {
+        lexios_set_nrf9151_power(true);
+        sat_append_log("[LexiSat] Powered ON nRF9151 (GPIO2 HIGH, UART2 115200 active).");
+        g_sat_pending_op = 1; // Query Modem ID automatically on power-up
+    }
+    refresh_lexisat_ui();
+}
+
+static void on_sat_op_btn_cb(lv_event_t *e)
+{
+    intptr_t op = (intptr_t)lv_event_get_user_data(e);
+    g_sat_pending_op = (int)op;
+    refresh_lexisat_ui();
+}
+
+static void on_sat_kb_rescan_cb(lv_event_t *e)
+{
+    (void)e;
+    tca8418_init();
+    if (tca8418_is_connected()) {
+        int duty = (g_kb_backlight_idx == 0) ? 0 : (g_kb_backlight_idx == 1) ? 5 : 25;
+        control_keyboard_backlight(20000, duty);
+        sat_append_log("[LexiSat] Physical QWERTY Keyboard detected on I2C4 (0x34)!");
+    } else {
+        sat_append_log("[LexiSat] Physical Keyboard not detected on I2C4 (0x34).");
+    }
+    refresh_lexisat_ui();
+}
+
+static void on_sat_kb_light_cb(lv_event_t *e)
+{
+    (void)e;
+    g_kb_backlight_idx = (g_kb_backlight_idx + 1) % 3;
+    int duty = (g_kb_backlight_idx == 0) ? 0 : (g_kb_backlight_idx == 1) ? 5 : 25;
+    control_keyboard_backlight(20000, duty);
+    refresh_lexisat_ui();
+}
+
+static void on_sat_send_sos_cb(lv_event_t *e)
+{
+    (void)e;
+    char sos_payload[256];
+    pthread_mutex_lock(&g_sat_lock);
+    snprintf(sos_payload, sizeof(sos_payload),
+             "SOS/POS [LexiOS K230] Lat:%s Lon:%s Alt:%s UTC:%s",
+             g_sat_lat, g_sat_lon, g_sat_alt, g_sat_utc);
+    snprintf(g_sat_custom_cmd, sizeof(g_sat_custom_cmd), "AT#XSEND=\"%s\"", sos_payload);
+    pthread_mutex_unlock(&g_sat_lock);
+
+    /* 1. Queue transmission over nRF9151 Satellite NTN / Cellular UART2 */
+    g_sat_pending_op = 5;
+
+    /* 2. Simultaneously broadcast emergency coordinates over SuperLexicon FLRC Mesh */
+    bool mesh_ok = (submit_mesh_chat_rpc("#emergency", sos_payload) == 0);
+    char log_line[300];
+    snprintf(log_line, sizeof(log_line), "SOS TX > Sat NTN + FLRC Mesh (%s): %s",
+             mesh_ok ? "RPC OK" : "Queued", sos_payload);
+    sat_append_log(log_line);
+    refresh_lexisat_ui();
+}
+
+static void on_sat_send_at_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!g_sat_input_ta) return;
+    const char *txt = lv_textarea_get_text(g_sat_input_ta);
+    if (!txt || !txt[0]) return;
+    pthread_mutex_lock(&g_sat_lock);
+    snprintf(g_sat_custom_cmd, sizeof(g_sat_custom_cmd), "%s", txt);
+    pthread_mutex_unlock(&g_sat_lock);
+    g_sat_pending_op = 5;
+    lv_textarea_set_text(g_sat_input_ta, "");
+    refresh_lexisat_ui();
+}
+
+LexiSatApp::LexiSatApp(bool use_status_bar, bool use_navigation_bar)
+    : ESP_Brookesia_PhoneApp(
+          ESP_BROOKESIA_CORE_APP_DATA_DEFAULT("LexiSat", &img_app_gnss, true),
+          ESP_BROOKESIA_PHONE_APP_DATA_DEFAULT(&img_app_gnss, use_status_bar, use_navigation_bar))
+{}
+
+LexiSatApp::~LexiSatApp() {}
+
+bool LexiSatApp::run(void)
+{
+    if (!g_sat_worker_started) {
+        g_sat_worker_started = true;
+        pthread_t tid;
+        if (pthread_create(&tid, nullptr, sat_uart_worker_thread, nullptr) == 0) {
+            pthread_detach(tid);
+        }
+    }
+
+    lv_area_t area = getVisualArea();
+    int w = area.x2 - area.x1;
+    int h = area.y2 - area.y1;
+    int card_w = w - 32;
+
+    lv_obj_t *root = lv_obj_create(lv_scr_act());
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, w, h);
+    lv_obj_align(root, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_set_style_bg_color(root, lv_color_hex(0x090D14), 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_COVER, 0);
+
+    /* 1. Header Card */
+    lv_obj_t *hdr = create_amoled_card(root, card_w, 96, 8);
+    lv_obj_t *title = lv_label_create(hdr);
+    lv_label_set_text(title, "LEXISAT  •  NTN SATELLITE, GNSS & KB");
+    lv_obj_set_style_text_color(title, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_sat_hdr_lbl = lv_label_create(hdr);
+    lv_obj_set_style_text_color(g_sat_hdr_lbl, lv_color_hex(0xE2E8F0), 0);
+    lv_obj_set_style_text_font(g_sat_hdr_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_sat_hdr_lbl, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    /* 2. Power, 3GPP Rel-17 Satellite / GNSS Mode & Keyboard Controls Card */
+    lv_obj_t *mcard = create_amoled_card(root, card_w, 136, 112);
+    int b4_w = (card_w - 56) / 4;
+
+    lv_obj_t *b_pwr = create_action_btn(mcard, "nRF9151 ON/OFF", b4_w, 46, 0x0F766E);
+    lv_obj_align(b_pwr, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_add_event_cb(b_pwr, on_sat_power_toggle_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_ntn = create_action_btn(mcard, "SAT NTN", b4_w, 46, 0x7C3AED);
+    lv_obj_align(b_ntn, LV_ALIGN_TOP_LEFT, b4_w + 8, 0);
+    lv_obj_add_event_cb(b_ntn, on_sat_op_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)2);
+
+    lv_obj_t *b_gps = create_action_btn(mcard, "GNSS Fix", b4_w, 46, 0x0284C7);
+    lv_obj_align(b_gps, LV_ALIGN_TOP_LEFT, (b4_w + 8) * 2, 0);
+    lv_obj_add_event_cb(b_gps, on_sat_op_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)3);
+
+    lv_obj_t *b_lte = create_action_btn(mcard, "LTE-M+GPS", b4_w, 46, 0x2563EB);
+    lv_obj_align(b_lte, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_add_event_cb(b_lte, on_sat_op_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)4);
+
+    /* Second row: Modem ID, SOS Beacon, Keyboard Re-Scan & Backlight */
+    lv_obj_t *b_id = create_action_btn(mcard, "Query ID", b4_w, 46, 0x334155);
+    lv_obj_align(b_id, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(b_id, on_sat_op_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)1);
+
+    lv_obj_t *b_sos = create_action_btn(mcard, "TX SOS+GPS", b4_w, 46, 0xDC2626);
+    lv_obj_align(b_sos, LV_ALIGN_BOTTOM_LEFT, b4_w + 8, 0);
+    lv_obj_add_event_cb(b_sos, on_sat_send_sos_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_kbs = create_action_btn(mcard, "Re-Scan KB", b4_w, 46, 0x4F46E5);
+    lv_obj_align(b_kbs, LV_ALIGN_BOTTOM_LEFT, (b4_w + 8) * 2, 0);
+    lv_obj_add_event_cb(b_kbs, on_sat_kb_rescan_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_kbl = create_action_btn(mcard, "KB Light", b4_w, 46, 0xD97706);
+    lv_obj_align(b_kbl, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(b_kbl, on_sat_kb_light_cb, LV_EVENT_CLICKED, nullptr);
+
+    /* 3. Live GNSS Telemetry & Modem Identity Card */
+    lv_obj_t *gcard = create_amoled_card(root, card_w, 106, 256);
+    g_sat_gnss_lbl = lv_label_create(gcard);
+    lv_obj_set_width(g_sat_gnss_lbl, card_w - 32);
+    lv_label_set_long_mode(g_sat_gnss_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(g_sat_gnss_lbl, lv_color_hex(0x25C281), 0);
+    lv_obj_set_style_text_font(g_sat_gnss_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_sat_gnss_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    /* 4. Live UART2 / Satellite Transceiver Log Card */
+    lv_obj_t *lcard = create_amoled_card(root, card_w, 134, 370);
+    g_sat_log_lbl = lv_label_create(lcard);
+    lv_obj_set_width(g_sat_log_lbl, card_w - 32);
+    lv_label_set_long_mode(g_sat_log_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(g_sat_log_lbl, lv_color_hex(0xE2E8F0), 0);
+    lv_obj_set_style_text_font(g_sat_log_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_sat_log_lbl, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    /* 5. AT Command / Satellite Payload Input + Touch & Physical Keyboard */
+    g_sat_input_ta = lv_textarea_create(root);
+    lv_obj_set_size(g_sat_input_ta, card_w - 124, 54);
+    lv_obj_align(g_sat_input_ta, LV_ALIGN_TOP_LEFT, 16, 512);
+    lv_textarea_set_one_line(g_sat_input_ta, true);
+    lv_textarea_set_placeholder_text(g_sat_input_ta, "AT command or Sat NTN payload...");
+    if (lv_group_get_default() != nullptr) {
+        lv_group_add_obj(lv_group_get_default(), g_sat_input_ta);
+        lv_group_focus_obj(g_sat_input_ta);
+    }
+
+    lv_obj_t *send_btn = create_action_btn(root, "SEND AT", 112, 54, 0x16A34A);
+    lv_obj_align(send_btn, LV_ALIGN_TOP_RIGHT, -16, 512);
+    lv_obj_add_event_cb(send_btn, on_sat_send_at_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *kb = lv_keyboard_create(root);
+    lv_obj_set_size(kb, w, 310);
+    lv_obj_align(kb, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_keyboard_set_textarea(kb, g_sat_input_ta);
+
+    refresh_lexisat_ui();
+    _sat_timer = lv_timer_create(sat_timer_cb, 1000, nullptr);
+    return true;
+}
+
+bool LexiSatApp::back(void)
+{
+    notifyCoreClosed();
+    return true;
+}
+
+bool LexiSatApp::close(void)
+{
+    if (_sat_timer) {
+        lv_timer_del(_sat_timer);
+        _sat_timer = nullptr;
+    }
+    g_sat_hdr_lbl = nullptr;
+    g_sat_gnss_lbl = nullptr;
+    g_sat_log_lbl = nullptr;
+    g_sat_input_ta = nullptr;
+    return true;
+}
+
+bool LexiSatApp::init(void) { return true; }

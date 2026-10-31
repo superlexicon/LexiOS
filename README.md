@@ -42,10 +42,19 @@ Designed as a lightweight, instant-on (`< 1.5s` boot), low-power sovereign alter
 
 ### 4. First-Party LexiOS Mobile Applications
 - **`SuperLexicon`**: Native 5-tab AMOLED node, mesh radio, subnet, and block explorer dashboard.
-- **`LexiSystem`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Real-time die temperature, 6-stage `CPU1` DVFS bar, `GPIO42` fan mode (`Auto` / `Force ON` / `Force OFF`), RF & power-gated domain status, and Pocket Standby controls.
-- **`LexiChat`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Off-grid encrypted FLRC mesh messenger over `superlexicon` JSON-RPC (`127.0.0.1:8545`) with channel switching (`#general`, `#mesh-ops`, `#emergency`), quick-beacon buttons, and full touch keyboard.
+- **`LexiSystem`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Real-time die temperature, 6-stage `CPU1` DVFS bar, `GPIO42` fan mode (`Auto` / `Force ON` / `Force OFF`), RF & power-gated domain status, `nRF9151` & physical `TCA8418` keyboard status, and Pocket Standby controls.
+- **`LexiChat`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Off-grid encrypted FLRC mesh messenger over `superlexicon` JSON-RPC (`127.0.0.1:8545`) with channel switching (`#general`, `#mesh-ops`, `#emergency`), quick-beacon buttons, and seamless physical (`TCA8418`) + touch keyboard input.
+- **`LexiSat`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Unified **3GPP Release 17 Satellite NTN (`NB-IoT NTN`)**, **GNSS/GPS positioning (`#XGPS` + automatic system `CLOCK_REALTIME` sync)**, **LTE-M/NB-IoT cellular**, and **Physical QWERTY Keyboard (`TCA8418` + `PWM4` backlight)** control center for the LILYGO `nRF9151` keyboard dock. Includes a one-tap **`TX SOS+GPS`** beacon that broadcasts live GPS coordinates simultaneously over the `nRF9151` satellite/cellular link (`AT#XSEND`) and the local **SuperLexicon FLRC Mesh (`#emergency`)**.
 - **`LexiApps`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): MMU-isolated `lwp` process supervisor (`Start` / `Restart` / `Stop` for `superlexicon.elf` & `lora_radio.elf`) and `/sdcard/apps/` `.wasm` / `.elf` package launcher.
 - **Curated Utilities**: `LoRa`, `Settings`, `Camera`, `Clock`, and `Calculator`.
+
+### 5. Hardware-Arbitrated `nRF9151` Satellite/GPS & `TCA8418` Keyboard Dock Support
+- **Safe `GPIO5` Pin-Mux Arbitration (`LR2021` `NRESET` vs `nRF9151` `UART2_TXD`)**:
+  - On T-Display-K230, `GPIO5` is shared between `LR2021` `NRESET` (active-low) and `nRF9151` `UART2_TXD`.
+  - When `nRF9151` is powered **OFF** (`0 mW` standby), `lexios_set_nrf9151_power(false)` locks `GPIO5` as a `GPIO` output `HIGH` *before* cutting `GPIO2` (`3.3V` rail), preventing unpowered `nRF9151` ESD clamping diodes from dragging `LR2021` into reset.
+  - When `nRF9151` is powered **ON**, `lexios_set_nrf9151_power(true)` raises `GPIO2` (`3.3V` rail) first, waits `150 ms` for the `nRF9151` I/O domain to stabilize, and then muxes `GPIO5`/`GPIO6` to `UART2_TXD`/`UART2_RXD` (where `UART2_TXD` idles `HIGH` at `3.3V`), keeping the `LR2021` FLRC mesh radio online concurrently.
+- **System-Wide Physical QWERTY Keyboard (`TCA8418` + `XL9555`)**:
+  - Registered as an LVGL `LV_INDEV_TYPE_KEYPAD` device ([`lv_port_indev.c`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/port/lv_port_indev.c)) with default focus group routing (`lv_group_set_default`) so any focused text field (`LexiChat`, `LexiSat`, `LoRa`, `Settings`) accepts physical keystrokes and wakes the display from **Pocket Standby** on key press.
 
 ---
 

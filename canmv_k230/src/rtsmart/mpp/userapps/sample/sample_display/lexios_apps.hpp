@@ -32,6 +32,10 @@ void lexios_set_sleep_timeout_sec(int sec);
 void lexios_notify_user_activity(void);
 uint64_t lexios_get_uptime_sec(void);
 
+/* nRF9151 Satellite NTN / GNSS / LTE-M Power & Pin-Mux Arbitration API */
+bool lexios_get_nrf9151_power(void);
+void lexios_set_nrf9151_power(bool enable);
+
 #ifdef __cplusplus
 }
 
@@ -65,7 +69,22 @@ private:
     lv_timer_t *_poll_timer = nullptr;
 };
 
-/* 3. LexiApps: MMU Process Supervisor & .wasm / .elf App Sandbox Runner */
+/* 3. LexiSat: nRF9151 Satellite NTN (3GPP Rel-17), GNSS/GPS & Physical QWERTY Keyboard Hub */
+class LexiSatApp : public ESP_Brookesia_PhoneApp {
+public:
+    LexiSatApp(bool use_status_bar = true, bool use_navigation_bar = true);
+    ~LexiSatApp() override;
+
+    bool run(void) override;
+    bool back(void) override;
+    bool close(void) override;
+    bool init(void) override;
+
+private:
+    lv_timer_t *_sat_timer = nullptr;
+};
+
+/* 4. LexiApps: MMU Process Supervisor & .wasm / .elf App Sandbox Runner */
 class LexiAppsApp : public ESP_Brookesia_PhoneApp {
 public:
     LexiAppsApp(bool use_status_bar = true, bool use_navigation_bar = true);
