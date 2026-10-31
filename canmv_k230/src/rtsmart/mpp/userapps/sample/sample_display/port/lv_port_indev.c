@@ -250,6 +250,10 @@ static void touchpad_read(lv_indev_drv_t * indev_drv, lv_indev_data_t * data)
 static lv_coord_t cached_touch_x = 0;
 static lv_coord_t cached_touch_y = 0;
 
+extern bool lexios_is_screen_asleep(void);
+extern void lexios_set_screen_sleep(bool sleep);
+extern void lexios_notify_user_activity(void);
+
 /*Return true is the touchpad is pressed*/
 static bool touchpad_is_pressed(void)
 {
@@ -258,6 +262,13 @@ static bool touchpad_is_pressed(void)
     point_number /= (int)sizeof(struct rt_touch_data);
     if (point_number > 0)
     {
+        lexios_notify_user_activity();
+        if (lexios_is_screen_asleep())
+        {
+            /* Wake screen from Pocket Standby on tap and consume the wake touch */
+            lexios_set_screen_sleep(false);
+            return false;
+        }
         cached_touch_x = (lv_coord_t)touch_data[0].x_coordinate;
         cached_touch_y = (lv_coord_t)touch_data[0].y_coordinate;
         return true;

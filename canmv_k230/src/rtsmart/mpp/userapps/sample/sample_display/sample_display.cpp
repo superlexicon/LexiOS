@@ -44,8 +44,11 @@
 #include "app_examples/phone/gnss/Gnss.hpp"
 #include "app_examples/phone/cellular/Cellular.hpp"
 #include "brookesia_app.hpp"
-#define USING_BLE
-#define USING_WEATHER
+#include "lexios_apps.hpp"
+#include "mpi_vo_api.h"
+#include "k_vo_comm.h"
+//#define USING_BLE
+//#define USING_WEATHER
 //#define USING_KEYBOARD
 // Disable synchronous I2C4 battery polling & thermal sensor reads in UI timer to prevent UI freezes
 //#define USING_BATTERY
@@ -56,6 +59,20 @@ static int gpio_fd = -1;
 static int fd_ts = -1;
 static volatile int g_os_thermal_level = 0; // 0 = normal (<68C), 1 = throttle (68..82C), 2 = emergency cutoff (>=82C)
 static volatile int g_os_cpu_dvfs_stage = -1; // 0=AUTO, 1=1188MHz, 2=800MHz, 3=594MHz, 4=400MHz, 5=200MHz
+static volatile double g_last_die_temp_c = 38.0;
+static volatile bool g_fan_active = false;
+static volatile int g_fan_mode = LEXIOS_FAN_AUTO;
+static volatile bool g_screen_asleep = false;
+static volatile int g_sleep_timeout_sec = 60; // Default 60s inactivity -> Pocket Standby
+static volatile long g_last_activity_sec = 0;
+static volatile long g_boot_time_sec = 0;
+
+extern "C" void disp_enable_update(void);
+extern "C" void disp_disable_update(void);
+extern k_u8 *pic_addr;
+extern k_video_frame_info vf_info;
+extern k_vo_osd osd_vo;
+
 #include <fcntl.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -68,6 +85,13 @@ static volatile int g_os_cpu_dvfs_stage = -1; // 0=AUTO, 1=1188MHz, 2=800MHz, 3=
 #define	GPIO_DM_INPUT_PULL_DOWN  _IOW('G', 3, int)
 #define	GPIO_WRITE_LOW           _IOW('G', 4, int)
 #define	GPIO_WRITE_HIGH          _IOW('G', 5, int)
+#define	GPIO_READ_VALUE          _IOW('G', 12, int)
+
+static long monotonic_sec_now(void) {
+    struct timespec ts = {0, 0};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long)ts.tv_sec;
+}
 
 static void write_os_thermal_state(int level, double temp_c) {
     struct timespec ts = {0, 0};
@@ -85,7 +109,7 @@ static void apply_cpu_dvfs_stage(int stage, double temp_c) {
     }
     if (stage <= 0) {
         kd_mpi_pm_set_governor(PM_DOMAIN_CPU, PM_GOVERNOR_AUTO);
-        printf("[OS-THERMAL] CPU1 DVFS -> AUTO (200 MHz idle / on-demand scaling) at %.1f C\n", temp_c);
+        printf("[LexiOS-PM] CPU1 DVFS -> AUTO (200 MHz idle / on-demand scaling) at %.1f C\n", temp_c);
         stage = 0;
     } else {
         // stage 1..5 maps directly to K230 PM_DOMAIN_CPU hardware profile index 1..5:
@@ -94,7 +118,7 @@ static void apply_cpu_dvfs_stage(int stage, double temp_c) {
         if (stage > 5) stage = 5;
         kd_mpi_pm_set_governor(PM_DOMAIN_CPU, PM_GOVERNOR_MANUAL);
         kd_mpi_pm_set_profile(PM_DOMAIN_CPU, stage);
-        printf("[OS-THERMAL] CPU1 DVFS -> Profile %d (%d MHz) at %.1f C (throttles all processes)\n",
+        printf("[LexiOS-PM] CPU1 DVFS -> Profile %d (%d MHz) at %.1f C (throttles all processes)\n",
                stage, kFreqMhz[stage], temp_c);
     }
     g_os_cpu_dvfs_stage = stage;
@@ -111,7 +135,7 @@ static void os_init_low_power_and_dvfs(void) {
 
     // Enable hardware AUTO frequency governor so idle CPU runs at 200 MHz instead of locked 1.6 GHz
     apply_cpu_dvfs_stage(0, 35.0);
-    printf("[OS-THERMAL] Initialized K230 PM: KPU/DPU/VPU powered off, CPU1 governor = AUTO.\n");
+    printf("[LexiOS-PM] Initialized K230 PM: KPU/DPU/VPU powered off, CPU1 governor = AUTO.\n");
 }
 
 static int compute_target_dvfs_stage(int prev_stage, double temp) {
@@ -129,9 +153,127 @@ static int compute_target_dvfs_stage(int prev_stage, double temp) {
     return 0;                   // AUTO (200 MHz idle <-> on-demand)
 }
 
+static void apply_fan_state(double temp) {
+    if (gpio_fd <= 0) return;
+    pin_gpio_t pin_42;
+    pin_42.pin = 42;
+    bool target_on = g_fan_active;
+    if (temp >= 68.0 || g_fan_mode == LEXIOS_FAN_FORCE_ON) {
+        target_on = true;
+    } else if (g_fan_mode == LEXIOS_FAN_FORCE_OFF) {
+        target_on = false;
+    } else {
+        if (temp >= 45.0) target_on = true;
+        else if (temp < 38.0) target_on = false;
+    }
+    if (target_on != g_fan_active) {
+        ioctl(gpio_fd, target_on ? GPIO_WRITE_HIGH : GPIO_WRITE_LOW, &pin_42);
+        g_fan_active = target_on;
+    }
+}
+
+extern "C" double lexios_get_die_temp_c(void) {
+    return g_last_die_temp_c;
+}
+
+extern "C" int lexios_get_cpu_dvfs_stage(void) {
+    return g_os_cpu_dvfs_stage < 0 ? 0 : g_os_cpu_dvfs_stage;
+}
+
+extern "C" int lexios_get_cpu_freq_mhz(void) {
+    static const int kFreqMhz[6] = {1600, 1188, 800, 594, 400, 200};
+    int st = lexios_get_cpu_dvfs_stage();
+    if (st < 0) st = 0;
+    if (st > 5) st = 5;
+    return kFreqMhz[st];
+}
+
+extern "C" int lexios_get_thermal_level(void) {
+    return g_os_thermal_level;
+}
+
+extern "C" bool lexios_get_fan_active(void) {
+    return g_fan_active;
+}
+
+extern "C" lexios_fan_mode_t lexios_get_fan_mode(void) {
+    return (lexios_fan_mode_t)g_fan_mode;
+}
+
+extern "C" void lexios_set_fan_mode(lexios_fan_mode_t mode) {
+    int m = (int)mode;
+    if (m < LEXIOS_FAN_AUTO || m > LEXIOS_FAN_FORCE_OFF) {
+        m = LEXIOS_FAN_AUTO;
+    }
+    g_fan_mode = m;
+    apply_fan_state(g_last_die_temp_c);
+}
+
+extern "C" bool lexios_is_screen_asleep(void) {
+    return g_screen_asleep;
+}
+
+extern "C" void lexios_notify_user_activity(void) {
+    g_last_activity_sec = monotonic_sec_now();
+}
+
+extern "C" int lexios_get_sleep_timeout_sec(void) {
+    return g_sleep_timeout_sec;
+}
+
+extern "C" void lexios_set_sleep_timeout_sec(int sec) {
+    g_sleep_timeout_sec = sec;
+    lexios_notify_user_activity();
+}
+
+extern "C" uint64_t lexios_get_uptime_sec(void) {
+    long now = monotonic_sec_now();
+    if (g_boot_time_sec == 0) g_boot_time_sec = now;
+    long diff = now - g_boot_time_sec;
+    return diff > 0 ? (uint64_t)diff : 0ULL;
+}
+
+extern "C" void lexios_set_screen_sleep(bool sleep_mode) {
+    if (sleep_mode == g_screen_asleep) {
+        return;
+    }
+    g_screen_asleep = sleep_mode;
+    if (sleep_mode) {
+        printf("[LexiOS-PM] Entering Pocket Standby: Blank RM69A10 AMOLED (GPIO25 LOW) + CPU1 -> 200 MHz Profile 5\n");
+        disp_disable_update();
+        if (pic_addr != NULL) {
+            memset(pic_addr, 0, 568 * 1232 * 4);
+            kd_mpi_vo_chn_insert_frame(osd_vo + 3, &vf_info);
+        }
+        kd_mpi_vo_osd_disable(osd_vo);
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_25;
+            pin_25.pin = 25;
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_25);
+            ioctl(gpio_fd, GPIO_WRITE_LOW, &pin_25);
+        }
+        apply_cpu_dvfs_stage(5, g_last_die_temp_c);
+    } else {
+        lexios_notify_user_activity();
+        int target_stage = compute_target_dvfs_stage(0, g_last_die_temp_c);
+        apply_cpu_dvfs_stage(target_stage, g_last_die_temp_c);
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_25;
+            pin_25.pin = 25;
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_25);
+            ioctl(gpio_fd, GPIO_WRITE_HIGH, &pin_25);
+        }
+        kd_mpi_vo_osd_enable(osd_vo);
+        disp_enable_update();
+        if (lv_scr_act() != NULL) {
+            lv_obj_invalidate(lv_scr_act());
+        }
+        printf("[LexiOS-PM] Woke from Pocket Standby: AMOLED ON (GPIO25 HIGH), CPU1 stage %d\n", target_stage);
+    }
+}
+
 static void *os_thermal_guardian_thread(void *arg) {
     (void)arg;
-    bool fan_on = false;
     os_init_low_power_and_dvfs();
     write_os_thermal_state(0, 35.0);
     while (1) {
@@ -159,23 +301,18 @@ static void *os_thermal_guardian_thread(void *arg) {
         if (temp < -20.0 || temp > 150.0) {
             continue;
         }
+        g_last_die_temp_c = temp;
 
-        // 1. Active fan control on GPIO42 (JP1 Pin 9) with hysteresis (ON >= 45C, OFF < 38C)
-        if (gpio_fd > 0) {
-            pin_gpio_t pin_42;
-            pin_42.pin = 42;
-            if (temp >= 45.0 && !fan_on) {
-                ioctl(gpio_fd, GPIO_WRITE_HIGH, &pin_42);
-                fan_on = true;
-            } else if (temp < 38.0 && fan_on) {
-                ioctl(gpio_fd, GPIO_WRITE_LOW, &pin_42);
-                fan_on = false;
-            }
+        // 1. Active fan control on GPIO42 (JP1 Pin 9) with hysteresis (ON >= 45C, OFF < 38C) or user mode
+        apply_fan_state(temp);
+
+        // 2. Progressive hardware CPU1 DVFS throttling (or 200 MHz Profile 5 when in Pocket Standby)
+        if (g_screen_asleep) {
+            apply_cpu_dvfs_stage(5, temp);
+        } else {
+            int next_dvfs = compute_target_dvfs_stage(g_os_cpu_dvfs_stage, temp);
+            apply_cpu_dvfs_stage(next_dvfs, temp);
         }
-
-        // 2. Progressive hardware CPU1 DVFS throttling (throttles ALL RT-Smart processes in hardware)
-        int next_dvfs = compute_target_dvfs_stage(g_os_cpu_dvfs_stage, temp);
-        apply_cpu_dvfs_stage(next_dvfs, temp);
 
         // 3. System / Radio thermal state machine (0 = normal, 1 = throttle duty/TX, 2 = emergency cutoff >=82C)
         int prev_level = g_os_thermal_level;
@@ -197,7 +334,7 @@ static void *os_thermal_guardian_thread(void *arg) {
 
         if (next_level != prev_level) {
             if (next_level == 2) {
-                printf("[OS-THERMAL] EMERGENCY CUTOFF: Die temp %.1f C >= 82 C! Powering down RF rails & pausing UI.\n", temp);
+                printf("[LexiOS-THERMAL] EMERGENCY CUTOFF: Die temp %.1f C >= 82 C! Powering down RF rails & pausing UI.\n", temp);
                 if (gpio_fd > 0) {
                     pin_gpio_t p42 = {.pin = 42};
                     pin_gpio_t p44 = {.pin = 44};
@@ -209,9 +346,9 @@ static void *os_thermal_guardian_thread(void *arg) {
                     ioctl(gpio_fd, GPIO_WRITE_LOW, &p45);  // Cut Wi-Fi power
                 }
             } else if (next_level == 1) {
-                printf("[OS-THERMAL] THROTTLE: Die temp %.1f C >= 68 C — stepping down CPU & radio TX power.\n", temp);
+                printf("[LexiOS-THERMAL] THROTTLE: Die temp %.1f C >= 68 C — stepping down CPU & radio TX power.\n", temp);
             } else {
-                printf("[OS-THERMAL] RECOVERY: Die temp cooled to %.1f C — resuming normal operation.\n", temp);
+                printf("[LexiOS-THERMAL] RECOVERY: Die temp cooled to %.1f C — resuming normal operation.\n", temp);
             }
         }
     }
@@ -617,81 +754,43 @@ void user_gui_init()
     ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->begin(), "Begin failed");
     // ESP_BROOKESIA_CHECK_FALSE_EXIT(phone->getCoreHome().showContainerBorder(), "Show container border failed");
 
-    /* Install apps */
-    /*
-    PhoneAppSimpleConf *app_simple_conf = new PhoneAppSimpleConf();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_simple_conf, "Create app simple conf failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_simple_conf) >= 0), "Install app simple conf failed");
-    PhoneAppComplexConf *app_complex_conf = new PhoneAppComplexConf();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_complex_conf, "Create app complex conf failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_complex_conf) >= 0), "Install app complex conf failed");
-    */
+    /* Install LexiOS First-Party & Curated Mobile Apps */
     SuperLexiconApp *app_superlexicon = new SuperLexiconApp();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_superlexicon, "Create app superlexicon failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_superlexicon) >= 0), "Install app superlexicon failed");
 
-    PhoneAppSquareline *app_squareline = new PhoneAppSquareline();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_squareline, "Create app squareline failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_squareline) >= 0), "Install app squareline failed");
-    Calculator *app_calculator = new Calculator();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_calculator, "Create app calculator failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_calculator) >= 0), "Install app calculator failed");
-    Game2048 *app_game2048 = new Game2048();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_game2048, "Create app game2048 failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_game2048) >= 0), "Install app game2048 failed");
-    Camera *app_camera = new Camera();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera, "Create app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera) >= 0), "Install app camera failed");
-#if 1
-    Music *app_music = new Music();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_music, "Create app music failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_music) >= 0), "Install app music failed");
-    
+    LexiSystemApp *app_lexisystem = new LexiSystemApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexisystem, "Create app lexisystem failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexisystem) >= 0), "Install app lexisystem failed");
+
+    LexiChatApp *app_lexichat = new LexiChatApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexichat, "Create app lexichat failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexichat) >= 0), "Install app lexichat failed");
+
+    LexiAppsApp *app_lexiapps = new LexiAppsApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexiapps, "Create app lexiapps failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexiapps) >= 0), "Install app lexiapps failed");
+
     Lora *app_lora = new Lora();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_lora, "Create app lora failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lora) >= 0), "Install app lora failed");
 
-    /*Hdmi *app_hdmi = new Hdmi();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_hdmi, "Create app hdmi failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_hdmi) >= 0), "Install app hdmi failed");
-    */
     AppSettings *app_setting = new AppSettings();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_setting, "Create app setting failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_setting) >= 0), "Install app setting failed");
-    
-    Led *app_led = new Led();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_led, "Create app led failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_led) >= 0), "Install app led failed");
 
-    Camera_face_detect *app_camera_face_detect = new Camera_face_detect();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera_face_detect, "camera_face_detect app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera_face_detect) >= 0), "Install app camera_face_detect failed");
-
-    /*Camera_head_detect *app_camera_head_detect = new Camera_head_detect();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera_head_detect, "camera_head_detect app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera_head_detect) >= 0), "Install app camera_head_detect failed");*/
-    #if 0
-    Camera_face_emotion *app_camera_emotiom_detect = new Camera_face_emotion();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera_emotiom_detect, "camera_emotion_detect app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera_emotiom_detect) >= 0), "Install app camera_emotion_detect failed");
-    #endif
-    /*Camera_object_segment *app_camera_segment_detect = new Camera_object_segment();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera_segment_detect, "camera_segment_detect app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera_segment_detect) >= 0), "Install app camera_segment_detect failed");*///memory limit
-    
-    
-    /*Camera_object_detect *app_camera_object_detect = new Camera_object_detect();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera_object_detect, "camera_object_detect app camera failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera_object_detect) >= 0), "Install app camera_object_detect failed");*/
+    Camera *app_camera = new Camera();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_camera, "Create app camera failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_camera) >= 0), "Install app camera failed");
 
     Clock *app_clock = new Clock();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_clock, "Create app clock failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_clock) >= 0), "Install app clock failed");
 
-    Artboard *app_artboard = new Artboard();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_artboard, "Create app artboard failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_artboard) >= 0), "Install app artboard failed");
-    #endif
+    Calculator *app_calculator = new Calculator();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_calculator, "Create app calculator failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_calculator) >= 0), "Install app calculator failed");
+
     #if defined(USING_BLE)  
     Ble *app_ble = new Ble();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_ble, "Create app ble failed");
@@ -702,35 +801,11 @@ void user_gui_init()
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_battery, "Create app battery failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_battery) >= 0), "Install app battery failed");
     #endif
-
-    Video *app_video = new Video();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_video, "Create app video failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_video) >= 0), "Install app video failed");
-
-    LiveCall *app_live_call = new LiveCall();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_live_call, "Create app live call failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_live_call) >= 0), "Install app live call failed");
-
-/*
-    LiveCallTest *app_live_call_test = new LiveCallTest();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_live_call_test, "Create app live call test failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_live_call_test) >= 0), "Install app live call test failed");
-    
-    
-    LiveCallSend *app_live_call_send = new LiveCallSend();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_live_call_send, "Create app live call send failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_live_call_send) >= 0), "Install app live call send failed");
-    
-    LiveCallRecv *app_live_call_recv = new LiveCallRecv();
-    ESP_BROOKESIA_CHECK_NULL_EXIT(app_live_call_recv, "Create app live call recv failed");
-    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_live_call_recv) >= 0), "Install app live call recv failed");
-*/
-   #if defined(USING_WEATHER)    
+    #if defined(USING_WEATHER)    
     Weather *app_weather = new Weather();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_weather, "Create app weather failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_weather) >= 0), "Install app weather failed");
     #endif
-    
     #if defined(USING_KEYBOARD)    
     KeyBoard *app_keyboard = new KeyBoard();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_keyboard, "Create app keyboard failed");
@@ -973,6 +1048,9 @@ printf("check_sum_dc:%d\n",check_sum_dc);
   printf("++++++++++++++++++++++++++++++++++++++++++++++++\n");  
 
 #endif    
+   g_boot_time_sec = monotonic_sec_now();
+   g_last_activity_sec = g_boot_time_sec;
+
    gpio_fd = open("/dev/gpio", O_RDWR);
    if (gpio_fd > 0)
    {
@@ -980,6 +1058,12 @@ printf("check_sum_dc:%d\n",check_sum_dc);
       pin_42.pin = 42;
       ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_42);  //pin42 fan output
       ioctl(gpio_fd, GPIO_WRITE_LOW, &pin_42);
+
+      // Configure GPIO0 (BOOT0 button) as input for Pocket Standby toggle
+      fpioa_set_function(0, GPIO0, 1, 0, 0, 0, -1, 1, -1);
+      pin_gpio_t pin_0;
+      pin_0.pin = 0;
+      ioctl(gpio_fd, GPIO_DM_INPUT, &pin_0);
    }
    fd_ts = open("/dev/ts", O_RDWR);
    if (fd_ts <= 0)
@@ -1209,6 +1293,18 @@ static int fd_hwtimer1=0;
 uint8_t reg_data;
 struct timespec last_ts;
 clock_gettime(CLOCK_MONOTONIC, &last_ts);
+
+unsigned short boot0_idle_val = 0;
+bool boot0_valid = false;
+int boot0_press_cnt = 0;
+if (gpio_fd > 0) {
+    pin_gpio_t p0 = {.pin = 0, .val = 0};
+    if (ioctl(gpio_fd, GPIO_READ_VALUE, &p0) == 0) {
+        boot0_idle_val = p0.val;
+        boot0_valid = true;
+    }
+}
+
 while(1)
     {
     if (g_os_thermal_level >= 2) {
@@ -1218,6 +1314,29 @@ while(1)
     }
     struct timespec now_ts;
     clock_gettime(CLOCK_MONOTONIC, &now_ts);
+
+    // Poll BOOT0 (GPIO0) hardware button for Pocket Standby toggle
+    if (boot0_valid && gpio_fd > 0) {
+        pin_gpio_t p0 = {.pin = 0, .val = boot0_idle_val};
+        if (ioctl(gpio_fd, GPIO_READ_VALUE, &p0) == 0) {
+            if (p0.val != boot0_idle_val) {
+                boot0_press_cnt++;
+                if (boot0_press_cnt == 2) {
+                    lexios_set_screen_sleep(!lexios_is_screen_asleep());
+                }
+            } else {
+                boot0_press_cnt = 0;
+            }
+        }
+    }
+
+    // Check touch inactivity timeout for automatic Pocket Standby
+    if (!g_screen_asleep && g_sleep_timeout_sec > 0) {
+        if ((now_ts.tv_sec - g_last_activity_sec) >= g_sleep_timeout_sec) {
+            lexios_set_screen_sleep(true);
+        }
+    }
+
     long elapsed_ms = (now_ts.tv_sec - last_ts.tv_sec) * 1000L +
                       (now_ts.tv_nsec - last_ts.tv_nsec) / 1000000L;
     if (elapsed_ms > 0) {
@@ -1225,7 +1344,11 @@ while(1)
         last_ts = now_ts;
     }
     lv_task_handler();
-    usleep(g_os_thermal_level == 1 ? 50000 : 10000);
+    if (g_screen_asleep) {
+        usleep(80000); // 80ms low-power poll interval during Pocket Standby
+    } else {
+        usleep(g_os_thermal_level == 1 ? 50000 : 10000);
+    }
     }
 	
     return 0;

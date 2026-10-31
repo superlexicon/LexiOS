@@ -8,13 +8,46 @@
  * @LastEditTime: 2025-06-17 09:00:00
  * @License: GPL 3.0
 -->
-<h1 align = "center">T-Display-K230_canmv_rt</h1>
+<h1 align="center">LexiOS — Sovereign RISC-V Mesh Mobile OS for K230</h1>
 
 <p align="center" width="100%">
-    <img src="image/k230_display_product.png" alt="T-Display K230 development board">
+    <img src="image/k230_display_product.png" alt="LexiOS on T-Display K230">
 </p>
 
-**English**
+## Overview
+
+**LexiOS** is a hard-real-time, MMU-isolated RISC-V mobile operating system built on RT-Smart (`rv64imafdcv`, XuanTie C908) for the **Kendryte K230** (`LILYGO T-Display-K230` 568x1232 RM69A10 AMOLED + Semtech LR2021 Sub-GHz / 2.4 GHz FLRC transceiver).
+
+Designed as a lightweight, instant-on (`< 1.5s` boot), low-power sovereign alternative to Android, **LexiOS** runs the full **SuperLexicon** Layer-1 blockchain node (`superlexicon.elf`), the **LR2021** FLRC mesh radio daemon (`lora_radio.elf`), and a 60 FPS AMOLED mobile shell (`app.elf`) in `< 95 MB` total RAM.
+
+---
+
+## Key Mobile OS Architecture (The 5 Pillars of LexiOS)
+
+### 1. Screen-Off Deep Standby ("Pocket Mode")
+- Pressing **`BOOT0` (`GPIO0`)**, tapping **Enter Pocket Standby Now** in **LexiSystem**, or reaching the configurable touch-inactivity timeout (`30s` / `60s` / `120s` / `Never`) blanks the `RM69A10` MIPI-DSI AMOLED panel (`K_VO_OSD3` zeroed + disabled, `GPIO25` LOW) and pins `CPU1` to **Hardware DVFS Profile `5` (`200 MHz` @ `0.62 V`, `-87.5%` dynamic CPU power)**.
+- While the screen is off in your pocket, `superlexicon.elf` and `lora_radio.elf` continue validating blocks and relaying FLRC mesh packets in the background.
+- Tapping the `GT9895` capacitive touchscreen or pressing `BOOT0` (`GPIO0`) instantaneously wakes the AMOLED panel and restores the hardware `AUTO` DVFS governor.
+
+### 2. RT-Smart Kernel Enhancements for Modern Runtimes (Rust / Go / Wasm / JIT)
+- **Hardware-Entropy CSPRNG (`/dev/urandom` & `/dev/random` + `sys_getrandom`)**:
+  - Registered `/dev/urandom` and `/dev/random` character devices in [`drv_ts.c`](canmv_k230/src/rtsmart/rtsmart/kernel/bsp/maix3/drivers/interdrv/tsensor/drv_ts.c) mixed with RISC-V `rdcycle`, `rdtime`, and die temperature ADC entropy.
+  - Added a direct hardware-entropy SplitMix64 fallback in `sys_getrandom()` ([`lwp_syscall.c`](canmv_k230/src/rtsmart/rtsmart/kernel/rt-thread/components/lwp/lwp_syscall.c)) and made `sys_madvise()` return `0` (`ENOSYS`-free allocator compatibility).
+- **Executable Page Mapping (`PROT_EXEC` + `fence.i`)**:
+  - Updated `lwp_mmap2()` ([`lwp_user_mm.c`](canmv_k230/src/rtsmart/rtsmart/kernel/rt-thread/components/lwp/lwp_user_mm.c)) to honor `PROT_EXEC` (`MM_AREA_TYPE_TEXT`) and execute `fence rw, rw; fence.i` for RISC-V instruction-cache coherency.
+
+### 3. Hardware-Protected 6-Stage Thermal & Power Guardian
+- **Kernel & Userland Power Gating**: Powers down unused `KPU`, `DPU`, and `VPU` hardware domains at boot (`pm_core.c` & `sample_display.cpp`) and keeps the `nRF9151` cellular modem (`GPIO2`) and Wi-Fi (`GPIO45`) rails off unless explicitly requested.
+- **6-Stage Progressive Hardware DVFS**: Scales `CPU1` across `AUTO` (`<50°C`), `1188 MHz` (`50°C`), `800 MHz` (`56°C`), `594 MHz` (`62°C`), `400 MHz` (`68°C`), and `200 MHz` (`>=74°C`) with `3°C` hysteresis and automatic `GPIO42` cooling fan control.
+
+### 4. First-Party LexiOS Mobile Applications
+- **`SuperLexicon`**: Native 5-tab AMOLED node, mesh radio, subnet, and block explorer dashboard.
+- **`LexiSystem`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Real-time die temperature, 6-stage `CPU1` DVFS bar, `GPIO42` fan mode (`Auto` / `Force ON` / `Force OFF`), RF & power-gated domain status, and Pocket Standby controls.
+- **`LexiChat`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): Off-grid encrypted FLRC mesh messenger over `superlexicon` JSON-RPC (`127.0.0.1:8545`) with channel switching (`#general`, `#mesh-ops`, `#emergency`), quick-beacon buttons, and full touch keyboard.
+- **`LexiApps`** ([`lexios_apps.cpp`](canmv_k230/src/rtsmart/mpp/userapps/sample/sample_display/lexios_apps.cpp)): MMU-isolated `lwp` process supervisor (`Start` / `Restart` / `Stop` for `superlexicon.elf` & `lora_radio.elf`) and `/sdcard/apps/` `.wasm` / `.elf` package launcher.
+- **Curated Utilities**: `LoRa`, `Settings`, `Camera`, `Clock`, and `Calculator`.
+
+---
 
 
 ## Version iteration:
