@@ -67,6 +67,7 @@ static volatile int g_sleep_timeout_sec = 60; // Default 60s inactivity -> Pocke
 static volatile long g_last_activity_sec = 0;
 static volatile long g_boot_time_sec = 0;
 static volatile bool g_nrf9151_power_on = false;
+static volatile bool g_wifi_ble_power_on = false;
 
 extern "C" void disp_enable_update(void);
 extern "C" void disp_disable_update(void);
@@ -273,6 +274,36 @@ extern "C" void lexios_set_nrf9151_power(bool enable) {
         }
         g_nrf9151_power_on = false;
         printf("[LexiOS-SAT] Powered OFF nRF9151 (GPIO2 LOW) & locked GPIO5 HIGH for LR2021\n");
+    }
+}
+
+extern "C" bool lexios_get_wifi_ble_power(void) {
+    return g_wifi_ble_power_on;
+}
+
+extern "C" void lexios_set_wifi_ble_power(bool enable) {
+    if (gpio_fd <= 0) {
+        gpio_fd = open("/dev/gpio", O_RDWR);
+    }
+    fpioa_set_function(45, GPIO45, -1, -1, -1, -1, -1, -1, -1);
+    if (enable) {
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_45 = {.pin = 45, .val = 1};
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_45);
+            ioctl(gpio_fd, GPIO_WRITE_HIGH, &pin_45);
+        }
+        fpioa_set_function(3, UART1_TXD, -1, -1, -1, -1, -1, -1, -1);
+        fpioa_set_function(4, UART1_RXD, -1, -1, -1, -1, -1, -1, -1);
+        g_wifi_ble_power_on = true;
+        printf("[LexiOS-RF] Powered ON Wi-Fi/BLE rail (GPIO45 HIGH) & muxed GPIO3/4 -> UART1 (BLE NUS)\n");
+    } else {
+        if (gpio_fd > 0) {
+            pin_gpio_t pin_45 = {.pin = 45, .val = 0};
+            ioctl(gpio_fd, GPIO_DM_OUTPUT, &pin_45);
+            ioctl(gpio_fd, GPIO_WRITE_LOW, &pin_45);
+        }
+        g_wifi_ble_power_on = false;
+        printf("[LexiOS-RF] Powered OFF Wi-Fi/BLE rail (GPIO45 LOW, 0mW Standby)\n");
     }
 }
 
@@ -813,6 +844,14 @@ void user_gui_init()
     LexiSatApp *app_lexisat = new LexiSatApp();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexisat, "Create app lexisat failed");
     ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexisat) >= 0), "Install app lexisat failed");
+
+    LexiRFApp *app_lexirf = new LexiRFApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexirf, "Create app lexirf failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexirf) >= 0), "Install app lexirf failed");
+
+    LexiPTTApp *app_lexiptt = new LexiPTTApp();
+    ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexiptt, "Create app lexiptt failed");
+    ESP_BROOKESIA_CHECK_FALSE_EXIT((phone->installApp(app_lexiptt) >= 0), "Install app lexiptt failed");
 
     LexiAppsApp *app_lexiapps = new LexiAppsApp();
     ESP_BROOKESIA_CHECK_NULL_EXIT(app_lexiapps, "Create app lexiapps failed");

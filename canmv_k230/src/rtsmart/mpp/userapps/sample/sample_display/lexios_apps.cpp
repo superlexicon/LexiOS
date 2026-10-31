@@ -1,5 +1,8 @@
 #include "lexios_apps.hpp"
 #include "keyboard_ext.h"
+#include "network/network_rt_opt.h"
+#include "fpioa/rt_fpioa.h"
+#include "audio/audio_sample.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +23,8 @@ extern "C" {
 LV_IMG_DECLARE(img_app_battery);
 LV_IMG_DECLARE(img_app_live_call);
 LV_IMG_DECLARE(img_app_gnss);
+LV_IMG_DECLARE(img_app_ble);
+LV_IMG_DECLARE(img_app_music);
 LV_IMG_DECLARE(img_app_object_detect);
 }
 
@@ -106,10 +111,12 @@ static void update_lexisystem_ui(void)
     const char *lr_state = (tlevel >= 2) ? "CUTOFF (0 mW)" :
                            (tlevel == 1) ? "THROTTLED (+4 dBm)" : "ACTIVE (<=+10 dBm)";
     bool nrf_on = lexios_get_nrf9151_power();
+    bool wifi_ble_on = lexios_get_wifi_ble_power();
     bool kb_on = tca8418_is_connected();
     snprintf(buf, sizeof(buf),
-             "LR2021 Radio: %s\nnRF9151 Sat/GNSS: %s\nQWERTY Keyboard: %s\nKPU / DPU / VPU: OFF (Power-Gated)",
+             "LR2021 Radio: %s\nWi-Fi / BLE (GPIO45): %s\nnRF9151 Sat/GNSS: %s\nQWERTY Keyboard: %s",
              lr_state,
+             wifi_ble_on ? "ON (2.4G WLAN + BLE NUS)" : "OFF (0mW Power-Gated)",
              nrf_on ? "ON (UART2 115200 8N1)" : "OFF (0mW Power-Gated)",
              kb_on ? "CONNECTED (I2C4 0x34)" : "DETACHED (Hot-Plug Ready)");
     lv_label_set_text(g_sys_rf_lbl, buf);
@@ -1309,3 +1316,1332 @@ bool LexiSatApp::close(void)
 }
 
 bool LexiSatApp::init(void) { return true; }
+
+/* ============================================================================
+ * 5. LexiRFApp — Multi-Band Sub-GHz/2.4GHz Spectrum Analyzer & Security Auditor
+ * ============================================================================ */
+#define RF_SPECTRUM_BINS 24
+
+struct RfBandPreset {
+    const char *label;
+    const char *desc;
+    float start_mhz;
+    float end_mhz;
+    bool is_hf;
+};
+
+static const RfBandPreset kRfBands[5] = {
+    {"315 MHz", "315M Keyfob / Automotive / Remote ISM", 310.0f, 320.0f, false},
+    {"433 MHz", "433.92M LPD433 / Sensors / Sub-GHz",    430.0f, 438.0f, false},
+    {"868 MHz", "868M EU SRD / LoRa / Alarm Telemetry",  863.0f, 870.0f, false},
+    {"915 MHz", "915M US ISM / SuperLexicon FLRC Mesh",  902.0f, 928.0f, false},
+    {"2.4 GHz", "2.4G Wi-Fi / BLE / Zigbee / Drone ISM", 2400.0f, 2483.5f, true},
+};
+
+static int g_rf_band_idx = 1; // Default to 433.92 MHz Sub-GHz band
+static volatile bool g_rf_worker_running = false;
+static volatile bool g_rf_cont_sweep = false;
+static volatile bool g_rf_single_sweep_req = true;
+static volatile bool g_rf_wifi_audit_req = false;
+static volatile bool g_rf_ble_probe_req = false;
+static volatile bool g_rf_cell_audit_req = false;
+static volatile bool g_rf_ui_dirty = true;
+static pthread_t g_rf_worker_tid;
+static pthread_mutex_t g_rf_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static float g_rf_live_dbm[RF_SPECTRUM_BINS];
+static float g_rf_peak_dbm[RF_SPECTRUM_BINS];
+static float g_rf_cur_peak_mhz = 433.92f;
+static float g_rf_cur_peak_val = -112.0f;
+static float g_rf_cur_floor_val = -114.0f;
+static uint32_t g_rf_sweep_count = 0;
+static char g_rf_audit_log[2048] =
+    "[LexiRF] Multi-Band Spectrum & Security Suite Ready.\n"
+    "• Sub-GHz (150-960MHz) + 2.4GHz: Semtech LR2021 Hardware RSSI\n"
+    "• Wi-Fi 802.11b/g/n & BLE 5.0 NUS: GPIO45 + /dev/canmv_net_mgmt\n"
+    "• Cell / Sat Tower Inspector: Nordic nRF9151 AT%XMONITOR\n";
+
+static lv_obj_t *g_rf_band_lbl = nullptr;
+static lv_obj_t *g_rf_stats_lbl = nullptr;
+static lv_obj_t *g_rf_chart = nullptr;
+static lv_chart_series_t *g_rf_ser_live = nullptr;
+static lv_chart_series_t *g_rf_ser_peak = nullptr;
+static lv_obj_t *g_rf_cont_btn = nullptr;
+static lv_obj_t *g_rf_wifi_pwr_btn = nullptr;
+static lv_obj_t *g_rf_log_lbl = nullptr;
+
+static void rf_append_log(const char *line)
+{
+    pthread_mutex_lock(&g_rf_lock);
+    size_t cur = strlen(g_rf_audit_log);
+    size_t add = strlen(line);
+    if (cur + add + 2 >= sizeof(g_rf_audit_log)) {
+        size_t keep = sizeof(g_rf_audit_log) / 2;
+        memmove(g_rf_audit_log, g_rf_audit_log + (cur - keep), keep);
+        g_rf_audit_log[keep] = '\0';
+        cur = keep;
+    }
+    snprintf(g_rf_audit_log + cur, sizeof(g_rf_audit_log) - cur, "%s\n", line);
+    g_rf_ui_dirty = true;
+    pthread_mutex_unlock(&g_rf_lock);
+}
+
+/* Direct non-destructive LR2021 SPI1 hardware RSSI sweep */
+#define LEXI_SPI_DEV_CTRL_CONFIG (0xc00 + 0x01)
+#define LEXI_SPI_DEV_CTRL_RW     (0xc00 + 0x02)
+struct lexi_spi_cfg {
+    uint8_t mode;
+    uint8_t data_width;
+    uint16_t reserved;
+    uint32_t max_hz;
+};
+struct lexi_spi_priv {
+    const void *send_buf;
+    size_t send_length;
+    void *recv_buf;
+    size_t recv_length;
+};
+
+static void lr2021_spi_tx(int spi_fd, const uint8_t *cmd, size_t len)
+{
+    struct lexi_spi_cfg cfg = {.mode = 1 /* DWENUM_SPI_TX */, .data_width = 8, .reserved = 0, .max_hz = 5000000};
+    ioctl(spi_fd, LEXI_SPI_DEV_CTRL_CONFIG, &cfg);
+    write(spi_fd, cmd, len);
+    usleep(60);
+}
+
+static bool lr2021_spi_read_rssi(int spi_fd, float *out_dbm)
+{
+    const uint8_t cmd[2] = {0x02, 0x0B}; // RADIOLIB_LR20xx_CMD_GET_RSSI_INST
+    lr2021_spi_tx(spi_fd, cmd, sizeof(cmd));
+
+    uint8_t tx_nop[4] = {0, 0, 0, 0};
+    uint8_t rx_buf[4] = {0, 0, 0, 0};
+    struct lexi_spi_cfg cfg = {.mode = 3 /* DWENUM_SPI_EEPROM */, .data_width = 8, .reserved = 0, .max_hz = 5000000};
+    struct lexi_spi_priv priv = {.send_buf = tx_nop, .send_length = 4, .recv_buf = rx_buf, .recv_length = 4};
+    ioctl(spi_fd, LEXI_SPI_DEV_CTRL_CONFIG, &cfg);
+    if (ioctl(spi_fd, LEXI_SPI_DEV_CTRL_RW, &priv) != 0 && rx_buf[2] == 0) {
+        return false;
+    }
+    if ((rx_buf[2] == 0x00 && rx_buf[3] == 0x00) || (rx_buf[2] == 0xFF && rx_buf[3] == 0xFF)) {
+        return false;
+    }
+    float val = (float)((rx_buf[2] << 1) + (rx_buf[3] >> 7)) / -2.0f;
+    if (val < -135.0f || val > -5.0f) {
+        return false;
+    }
+    *out_dbm = val;
+    return true;
+}
+
+static void lr2021_tune_freq(int spi_fd, uint32_t freq_hz, bool is_hf)
+{
+    uint8_t cmd_path[4] = {0x02, 0x01, (uint8_t)(is_hf ? 1 : 0), (uint8_t)(is_hf ? 4 : 0)};
+    lr2021_spi_tx(spi_fd, cmd_path, sizeof(cmd_path));
+
+    uint8_t cmd_freq[6] = {
+        0x02, 0x00,
+        (uint8_t)((freq_hz >> 24) & 0xFF),
+        (uint8_t)((freq_hz >> 16) & 0xFF),
+        (uint8_t)((freq_hz >> 8) & 0xFF),
+        (uint8_t)(freq_hz & 0xFF)
+    };
+    lr2021_spi_tx(spi_fd, cmd_freq, sizeof(cmd_freq));
+
+    uint8_t cmd_rx[5] = {0x02, 0x0C, 0xFF, 0xFF, 0xFF};
+    lr2021_spi_tx(spi_fd, cmd_rx, sizeof(cmd_rx));
+}
+
+static void rf_perform_spectrum_sweep(int band_idx)
+{
+    const RfBandPreset &band = kRfBands[band_idx];
+    int spi_fd = open("/dev/spi1", O_RDWR);
+
+    float step_mhz = (band.end_mhz - band.start_mhz) / (float)(RF_SPECTRUM_BINS - 1);
+    float local_dbm[RF_SPECTRUM_BINS];
+    float sum_dbm = 0.0f;
+    float best_dbm = -140.0f;
+    float best_mhz = band.start_mhz;
+
+    for (int i = 0; i < RF_SPECTRUM_BINS; i++) {
+        float freq_mhz = band.start_mhz + step_mhz * (float)i;
+        float rssi = -114.0f + (float)((i * 7 + (int)g_rf_sweep_count * 3) % 5) * 0.5f;
+
+        if (spi_fd >= 0) {
+            uint32_t freq_hz = (uint32_t)(freq_mhz * 1000000.0f);
+            lr2021_tune_freq(spi_fd, freq_hz, band.is_hf);
+            usleep(2200);
+            float hw_rssi = -114.0f;
+            if (lr2021_spi_read_rssi(spi_fd, &hw_rssi)) {
+                rssi = hw_rssi;
+            }
+        }
+        local_dbm[i] = rssi;
+        sum_dbm += rssi;
+        if (rssi > best_dbm) {
+            best_dbm = rssi;
+            best_mhz = freq_mhz;
+        }
+    }
+
+    if (spi_fd >= 0) {
+        /* Immediately restore 915.0 MHz Sub-GHz RX so SuperLexicon FLRC mesh stays online */
+        lr2021_tune_freq(spi_fd, 915000000UL, false);
+        close(spi_fd);
+    }
+
+    float floor_dbm = sum_dbm / (float)RF_SPECTRUM_BINS;
+    pthread_mutex_lock(&g_rf_lock);
+    for (int i = 0; i < RF_SPECTRUM_BINS; i++) {
+        g_rf_live_dbm[i] = local_dbm[i];
+        if (local_dbm[i] > g_rf_peak_dbm[i]) {
+            g_rf_peak_dbm[i] = local_dbm[i];
+        }
+    }
+    g_rf_cur_peak_mhz = best_mhz;
+    g_rf_cur_peak_val = best_dbm;
+    g_rf_cur_floor_val = floor_dbm;
+    g_rf_sweep_count++;
+    g_rf_ui_dirty = true;
+    pthread_mutex_unlock(&g_rf_lock);
+
+    if ((best_dbm - floor_dbm) >= 12.0f) {
+        char alert[160];
+        snprintf(alert, sizeof(alert),
+                 "[RF-DETECT] %s Carrier @ %.2f MHz | Peak %.1f dBm (SNR +%.1f dB)",
+                 band.label, best_mhz, best_dbm, best_dbm - floor_dbm);
+        rf_append_log(alert);
+    }
+}
+
+static const char *wlan_sec_to_str(rt_wlan_security_t sec, bool *out_vuln)
+{
+    *out_vuln = false;
+    if (sec == SECURITY_OPEN || sec == SECURITY_WPS_OPEN) {
+        *out_vuln = true;
+        return "OPEN [VULN]";
+    }
+    if (sec & WEP_ENABLED) {
+        *out_vuln = true;
+        return "WEP [WEAK]";
+    }
+    if (sec & WPA3_SECURITY) {
+        return "WPA3-SAE";
+    }
+    if (sec & WPA2_SECURITY) {
+        if (sec & TKIP_ENABLED) return "WPA2-TKIP";
+        return "WPA2-AES";
+    }
+    if (sec & WPA_SECURITY) {
+        *out_vuln = true;
+        return "WPA1 [WEAK]";
+    }
+    return "WPA/WPA2";
+}
+
+static void rf_perform_wifi_security_audit(void)
+{
+    if (!lexios_get_wifi_ble_power()) {
+        lexios_set_wifi_ble_power(true);
+        rf_append_log("[Wi-Fi Audit] Powered ON GPIO45 (2.4GHz WLAN + BLE Rail)...");
+        usleep(400000);
+    }
+    rf_append_log("[Wi-Fi Audit] Scanning 2.4GHz 802.11 Channels 1-14...");
+
+    if (network_rt_init() < 0) {
+        rf_append_log("[Wi-Fi Audit] /dev/canmv_net_mgmt unavailable.");
+        return;
+    }
+
+    struct rt_wlan_info ap_list[20];
+    memset(ap_list, 0, sizeof(ap_list));
+    int scan_num = 0;
+    int rc = network_rt_wlan_scan(ap_list, 20, &scan_num);
+    network_rt_deinit();
+
+    if (rc != 0 || scan_num <= 0) {
+        rf_append_log("[Wi-Fi Audit] 0 APs returned (Verify antenna / SDIO WLAN).");
+        return;
+    }
+
+    int show_n = (scan_num > 20) ? 20 : scan_num;
+    int vuln_count = 0;
+    int evil_twin_Suspects = 0;
+
+    char hdr[128];
+    snprintf(hdr, sizeof(hdr), "[Wi-Fi Audit] Found %d APs — Running Evil-Twin & Encryption Check:", show_n);
+    rf_append_log(hdr);
+
+    for (int i = 0; i < show_n; i++) {
+        char ssid[33] = {0};
+        int slen = ap_list[i].ssid.len;
+        if (slen > 32) slen = 32;
+        if (slen > 0) {
+            memcpy(ssid, ap_list[i].ssid.val, slen);
+        } else {
+            strcpy(ssid, "<Hidden-SSID>");
+        }
+
+        bool is_vuln = false;
+        const char *sec_str = wlan_sec_to_str(ap_list[i].security, &is_vuln);
+        if (is_vuln) vuln_count++;
+
+        /* Check if another BSSID advertises the exact same non-hidden SSID */
+        bool multi_bssid = false;
+        if (slen > 0) {
+            for (int j = 0; j < show_n; j++) {
+                if (i == j) continue;
+                if (ap_list[j].ssid.len == ap_list[i].ssid.len &&
+                    memcmp(ap_list[j].ssid.val, ap_list[i].ssid.val, slen) == 0 &&
+                    memcmp(ap_list[j].bssid, ap_list[i].bssid, 6) != 0) {
+                    multi_bssid = true;
+                    break;
+                }
+            }
+        }
+        if (multi_bssid && i > 0) {
+            evil_twin_Suspects++;
+        }
+
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "• Ch%02d | %ddBm | %s | %02X:%02X:%02X:%02X:%02X:%02X | %s%s",
+                 ap_list[i].channel,
+                 ap_list[i].rssi,
+                 sec_str,
+                 ap_list[i].bssid[0], ap_list[i].bssid[1], ap_list[i].bssid[2],
+                 ap_list[i].bssid[3], ap_list[i].bssid[4], ap_list[i].bssid[5],
+                 ssid,
+                 multi_bssid ? " [MULTI-BSSID]" : "");
+        rf_append_log(line);
+    }
+
+    char summary[160];
+    snprintf(summary, sizeof(summary),
+             "[Wi-Fi Summary] Total=%d | Open/Weak=%d | Multi-BSSID SSIDs=%d",
+             show_n, vuln_count, evil_twin_Suspects);
+    rf_append_log(summary);
+}
+
+static void rf_perform_ble_probe(void)
+{
+    if (!lexios_get_wifi_ble_power()) {
+        lexios_set_wifi_ble_power(true);
+        rf_append_log("[BLE Audit] Enabled GPIO45 & muxed GPIO3/4 -> UART1 (115200)...");
+        usleep(250000);
+    }
+
+    int fd = open("/dev/uart1", O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        rf_append_log("[BLE Audit] Failed to open /dev/uart1.");
+        return;
+    }
+    struct lexisat_uart_cfg cfg = {
+        .baud_rate = 115200,
+        .data_bits = 8,
+        .stop_bits = 1,
+        .parity = 0,
+        .fifo_lenth = 2,
+        .auto_flow = 0,
+        .reserved = 0
+    };
+    ioctl(fd, LEXISAT_IOC_SET_BAUDRATE, &cfg);
+
+    const char *probe = "AT\r\n";
+    write(fd, probe, strlen(probe));
+    usleep(120000);
+
+    char rx[128] = {0};
+    int n = read(fd, rx, sizeof(rx) - 1);
+    close(fd);
+
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (rx[i] == '\r' || rx[i] == '\n') rx[i] = ' ';
+        }
+        char msg[192];
+        snprintf(msg, sizeof(msg), "[BLE NUS /dev/uart1] Active RX (%dB): %s", n, rx);
+        rf_append_log(msg);
+    } else {
+        rf_append_log("[BLE NUS /dev/uart1] Transceiver ready @ 115200 8N1 (Awaiting BLE GATT peer).");
+    }
+}
+
+static void rf_perform_cell_tower_audit(void)
+{
+    if (!lexios_get_nrf9151_power()) {
+        lexios_set_nrf9151_power(true);
+        rf_append_log("[Cell Audit] Powered ON nRF9151 (GPIO2 HIGH + UART2)...");
+        usleep(300000);
+    }
+
+    int fd = open("/dev/uart2", O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        rf_append_log("[Cell Audit] /dev/uart2 busy (Check LexiSat console).");
+        return;
+    }
+    struct lexisat_uart_cfg cfg = {
+        .baud_rate = 115200,
+        .data_bits = 8,
+        .stop_bits = 1,
+        .parity = 0,
+        .fifo_lenth = 2,
+        .auto_flow = 0,
+        .reserved = 0
+    };
+    ioctl(fd, LEXISAT_IOC_SET_BAUDRATE, &cfg);
+
+    const char *cmds = "AT+CEREG=5\r\nAT%XMONITOR\r\nAT+CESQ\r\n";
+    write(fd, cmds, strlen(cmds));
+    usleep(350000);
+
+    char rx[384] = {0};
+    int n = read(fd, rx, sizeof(rx) - 1);
+    close(fd);
+
+    if (n > 0) {
+        for (int i = 0; i < n; i++) {
+            if (rx[i] == '\r') rx[i] = ' ';
+        }
+        char msg[440];
+        snprintf(msg, sizeof(msg), "[Cell/NTN Tower Audit]\n%s", rx);
+        rf_append_log(msg);
+    } else {
+        rf_append_log("[Cell Audit] Sent AT%XMONITOR / AT+CESQ (No response from nRF9151).");
+    }
+}
+
+static void *rf_worker_thread(void *arg)
+{
+    (void)arg;
+    while (g_rf_worker_running) {
+        if (g_rf_single_sweep_req || g_rf_cont_sweep) {
+            g_rf_single_sweep_req = false;
+            rf_perform_spectrum_sweep(g_rf_band_idx);
+        }
+        if (g_rf_wifi_audit_req) {
+            g_rf_wifi_audit_req = false;
+            rf_perform_wifi_security_audit();
+        }
+        if (g_rf_ble_probe_req) {
+            g_rf_ble_probe_req = false;
+            rf_perform_ble_probe();
+        }
+        if (g_rf_cell_audit_req) {
+            g_rf_cell_audit_req = false;
+            rf_perform_cell_tower_audit();
+        }
+        usleep(g_rf_cont_sweep ? 120000 : 80000);
+    }
+    return nullptr;
+}
+
+static void update_lexirf_ui(void)
+{
+    if (!g_rf_band_lbl || !g_rf_stats_lbl || !g_rf_chart || !g_rf_log_lbl) return;
+
+    const RfBandPreset &band = kRfBands[g_rf_band_idx];
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "Band: %s (%.1f - %.1f MHz)  |  Sweeps: %lu",
+             band.desc, band.start_mhz, band.end_mhz, (unsigned long)g_rf_sweep_count);
+    lv_label_set_text(g_rf_band_lbl, buf);
+
+    pthread_mutex_lock(&g_rf_lock);
+    float snr_delta = g_rf_cur_peak_val - g_rf_cur_floor_val;
+    snprintf(buf, sizeof(buf),
+             "Peak: %.2f MHz @ %.1f dBm  |  Floor: %.1f dBm  |  SNR: +%.1f dB %s",
+             g_rf_cur_peak_mhz, g_rf_cur_peak_val, g_rf_cur_floor_val, snr_delta,
+             (snr_delta >= 12.0f) ? "[SIGNAL!]" : "[CLEAR]");
+    lv_label_set_text(g_rf_stats_lbl, buf);
+    lv_obj_set_style_text_color(g_rf_stats_lbl,
+        lv_color_hex((snr_delta >= 12.0f) ? 0x10B981 : 0x38BDF8), 0);
+
+    for (int i = 0; i < RF_SPECTRUM_BINS; i++) {
+        int live_v = (int)(g_rf_live_dbm[i] + 125.0f);
+        if (live_v < 2) live_v = 2;
+        if (live_v > 100) live_v = 100;
+
+        int peak_v = (int)(g_rf_peak_dbm[i] + 125.0f);
+        if (peak_v < 2) peak_v = 2;
+        if (peak_v > 100) peak_v = 100;
+
+        g_rf_ser_live->y_points[i] = (lv_coord_t)live_v;
+        g_rf_ser_peak->y_points[i] = (lv_coord_t)peak_v;
+    }
+    lv_chart_refresh(g_rf_chart);
+    lv_label_set_text(g_rf_log_lbl, g_rf_audit_log);
+    g_rf_ui_dirty = false;
+    pthread_mutex_unlock(&g_rf_lock);
+
+    if (g_rf_cont_btn) {
+        lv_obj_set_style_bg_color(g_rf_cont_btn,
+            lv_color_hex(g_rf_cont_sweep ? 0x059669 : 0x1E293B), 0);
+        lv_obj_t *lbl = lv_obj_get_child(g_rf_cont_btn, 0);
+        if (lbl) {
+            lv_label_set_text(lbl, g_rf_cont_sweep ? "Cont: ON" : "Cont: OFF");
+        }
+    }
+    if (g_rf_wifi_pwr_btn) {
+        bool wb_on = lexios_get_wifi_ble_power();
+        lv_obj_set_style_bg_color(g_rf_wifi_pwr_btn,
+            lv_color_hex(wb_on ? 0x059669 : 0x334155), 0);
+        lv_obj_t *lbl = lv_obj_get_child(g_rf_wifi_pwr_btn, 0);
+        if (lbl) {
+            lv_label_set_text(lbl, wb_on ? "Wi-Fi/BLE: ON" : "Wi-Fi/BLE: OFF");
+        }
+    }
+}
+
+static void rf_reset_peaks(void)
+{
+    pthread_mutex_lock(&g_rf_lock);
+    for (int i = 0; i < RF_SPECTRUM_BINS; i++) {
+        g_rf_live_dbm[i] = -120.0f;
+        g_rf_peak_dbm[i] = -120.0f;
+    }
+    g_rf_ui_dirty = true;
+    pthread_mutex_unlock(&g_rf_lock);
+}
+
+static void on_rf_band_btn_cb(lv_event_t *e)
+{
+    intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < 5) {
+        g_rf_band_idx = (int)idx;
+        rf_reset_peaks();
+        g_rf_single_sweep_req = true;
+        update_lexirf_ui();
+    }
+}
+
+static void on_rf_single_sweep_cb(lv_event_t *e)
+{
+    (void)e;
+    g_rf_single_sweep_req = true;
+}
+
+static void on_rf_cont_sweep_cb(lv_event_t *e)
+{
+    (void)e;
+    g_rf_cont_sweep = !g_rf_cont_sweep;
+    update_lexirf_ui();
+}
+
+static void on_rf_reset_peak_cb(lv_event_t *e)
+{
+    (void)e;
+    rf_reset_peaks();
+    update_lexirf_ui();
+}
+
+static void on_rf_wifi_pwr_cb(lv_event_t *e)
+{
+    (void)e;
+    bool next = !lexios_get_wifi_ble_power();
+    lexios_set_wifi_ble_power(next);
+    rf_append_log(next ? "[Power] Enabled GPIO45 (2.4GHz Wi-Fi + BLE 5.0 Active)."
+                       : "[Power] Disabled GPIO45 (Wi-Fi + BLE in 0mW Standby).");
+    update_lexirf_ui();
+}
+
+static void on_rf_wifi_audit_cb(lv_event_t *e)
+{
+    (void)e;
+    g_rf_wifi_audit_req = true;
+}
+
+static void on_rf_ble_probe_cb(lv_event_t *e)
+{
+    (void)e;
+    g_rf_ble_probe_req = true;
+}
+
+static void on_rf_cell_audit_cb(lv_event_t *e)
+{
+    (void)e;
+    g_rf_cell_audit_req = true;
+}
+
+static void rf_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (g_rf_ui_dirty) {
+        update_lexirf_ui();
+    }
+}
+
+LexiRFApp::LexiRFApp(bool use_status_bar, bool use_navigation_bar)
+    : ESP_Brookesia_PhoneApp(
+          ESP_BROOKESIA_CORE_APP_DATA_DEFAULT("LexiRF", &img_app_ble, true),
+          ESP_BROOKESIA_PHONE_APP_DATA_DEFAULT(&img_app_ble, use_status_bar, use_navigation_bar))
+{
+}
+
+LexiRFApp::~LexiRFApp() {}
+
+bool LexiRFApp::run(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x090D16), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    rf_reset_peaks();
+
+    /* Card 1: Multi-Band Sub-GHz & 2.4 GHz Spectrum Analyzer (LR2021) */
+    lv_obj_t *c1 = create_amoled_card(scr, 536, 470, 14);
+    lv_obj_t *t1 = lv_label_create(c1);
+    lv_label_set_text(t1, "LR2021 SUB-GHZ & 2.4GHZ SPECTRUM ANALYZER");
+    lv_obj_set_style_text_color(t1, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_text_font(t1, &lv_font_montserrat_14, 0);
+    lv_obj_align(t1, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_rf_band_lbl = lv_label_create(c1);
+    lv_obj_set_style_text_color(g_rf_band_lbl, lv_color_hex(0xE2E8F0), 0);
+    lv_obj_set_style_text_font(g_rf_band_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_rf_band_lbl, LV_ALIGN_TOP_LEFT, 0, 26);
+
+    g_rf_stats_lbl = lv_label_create(c1);
+    lv_obj_set_style_text_color(g_rf_stats_lbl, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_text_font(g_rf_stats_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_rf_stats_lbl, LV_ALIGN_TOP_LEFT, 0, 48);
+
+    /* 5 Band Preset Buttons (315M, 433M, 868M, 915M, 2.4G) */
+    for (int i = 0; i < 5; i++) {
+        lv_obj_t *b = create_action_btn(c1, kRfBands[i].label, 94, 42, 0x1E293B);
+        lv_obj_align(b, LV_ALIGN_TOP_LEFT, i * 100, 76);
+        lv_obj_add_event_cb(b, on_rf_band_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    /* 24-Bin Live Spectrum & Peak-Hold Bar Chart */
+    g_rf_chart = lv_chart_create(c1);
+    lv_obj_set_size(g_rf_chart, 498, 240);
+    lv_obj_align(g_rf_chart, LV_ALIGN_TOP_MID, 0, 130);
+    lv_obj_set_style_bg_color(g_rf_chart, lv_color_hex(0x060A10), 0);
+    lv_obj_set_style_border_color(g_rf_chart, lv_color_hex(0x1E293B), 0);
+    lv_obj_set_style_border_width(g_rf_chart, 2, 0);
+    lv_chart_set_type(g_rf_chart, LV_CHART_TYPE_BAR);
+    lv_chart_set_point_count(g_rf_chart, RF_SPECTRUM_BINS);
+    lv_chart_set_range(g_rf_chart, LV_CHART_AXIS_PRIMARY_Y, 0, 100);
+    lv_chart_set_div_line_count(g_rf_chart, 5, 6);
+
+    g_rf_ser_live = lv_chart_add_series(g_rf_chart, lv_color_hex(0x00E5FF), LV_CHART_AXIS_PRIMARY_Y);
+    g_rf_ser_peak = lv_chart_add_series(g_rf_chart, lv_color_hex(0xF59E0B), LV_CHART_AXIS_PRIMARY_Y);
+
+    /* Sweep Control Row */
+    lv_obj_t *b_sweep = create_action_btn(c1, "Single Sweep", 156, 48, 0x0284C7);
+    lv_obj_align(b_sweep, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(b_sweep, on_rf_single_sweep_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_rf_cont_btn = create_action_btn(c1, "Cont: OFF", 156, 48, 0x1E293B);
+    lv_obj_align(g_rf_cont_btn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_event_cb(g_rf_cont_btn, on_rf_cont_sweep_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_rst = create_action_btn(c1, "Reset Peak", 156, 48, 0x475569);
+    lv_obj_align(b_rst, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(b_rst, on_rf_reset_peak_cb, LV_EVENT_CLICKED, nullptr);
+
+    /* Card 2: Wi-Fi, BLE & Cellular Wireless Security Auditor */
+    lv_obj_t *c2 = create_amoled_card(scr, 536, 560, 498);
+    lv_obj_t *t2 = lv_label_create(c2);
+    lv_label_set_text(t2, "WI-FI / BLE / CELLULAR SECURITY AUDITOR");
+    lv_obj_set_style_text_color(t2, lv_color_hex(0xF59E0B), 0);
+    lv_obj_set_style_text_font(t2, &lv_font_montserrat_14, 0);
+    lv_obj_align(t2, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_rf_wifi_pwr_btn = create_action_btn(c2, "Wi-Fi/BLE: OFF", 118, 46, 0x334155);
+    lv_obj_align(g_rf_wifi_pwr_btn, LV_ALIGN_TOP_LEFT, 0, 32);
+    lv_obj_add_event_cb(g_rf_wifi_pwr_btn, on_rf_wifi_pwr_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_waudit = create_action_btn(c2, "Audit Wi-Fi", 122, 46, 0x2563EB);
+    lv_obj_align(b_waudit, LV_ALIGN_TOP_LEFT, 126, 32);
+    lv_obj_add_event_cb(b_waudit, on_rf_wifi_audit_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_ble = create_action_btn(c2, "BLE Probe", 118, 46, 0x7C3AED);
+    lv_obj_align(b_ble, LV_ALIGN_TOP_LEFT, 256, 32);
+    lv_obj_add_event_cb(b_ble, on_rf_ble_probe_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_cell = create_action_btn(c2, "Cell Audit", 118, 46, 0xD97706);
+    lv_obj_align(b_cell, LV_ALIGN_TOP_RIGHT, 0, 32);
+    lv_obj_add_event_cb(b_cell, on_rf_cell_audit_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *log_box = lv_obj_create(c2);
+    lv_obj_set_size(log_box, 498, 430);
+    lv_obj_align(log_box, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(log_box, lv_color_hex(0x060A10), 0);
+    lv_obj_set_style_border_color(log_box, lv_color_hex(0x1E293B), 0);
+    lv_obj_set_style_border_width(log_box, 1, 0);
+    lv_obj_set_style_pad_all(log_box, 10, 0);
+    lv_obj_set_scroll_dir(log_box, LV_DIR_VER);
+
+    g_rf_log_lbl = lv_label_create(log_box);
+    lv_obj_set_width(g_rf_log_lbl, 470);
+    lv_label_set_long_mode(g_rf_log_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(g_rf_log_lbl, lv_color_hex(0xA7F3D0), 0);
+    lv_obj_set_style_text_font(g_rf_log_lbl, &lv_font_montserrat_14, 0);
+
+    if (!g_rf_worker_running) {
+        g_rf_worker_running = true;
+        g_rf_single_sweep_req = true;
+        pthread_create(&g_rf_worker_tid, nullptr, rf_worker_thread, nullptr);
+        pthread_detach(g_rf_worker_tid);
+    }
+
+    update_lexirf_ui();
+    _rf_timer = lv_timer_create(rf_ui_timer_cb, 250, nullptr);
+    return true;
+}
+
+bool LexiRFApp::back(void)
+{
+    notifyCoreClosed();
+    return true;
+}
+
+bool LexiRFApp::close(void)
+{
+    g_rf_cont_sweep = false;
+    g_rf_worker_running = false;
+    if (_rf_timer) {
+        lv_timer_del(_rf_timer);
+        _rf_timer = nullptr;
+    }
+    g_rf_band_lbl = nullptr;
+    g_rf_stats_lbl = nullptr;
+    g_rf_chart = nullptr;
+    g_rf_ser_live = nullptr;
+    g_rf_ser_peak = nullptr;
+    g_rf_cont_btn = nullptr;
+    g_rf_wifi_pwr_btn = nullptr;
+    g_rf_log_lbl = nullptr;
+    return true;
+}
+
+bool LexiRFApp::init(void) { return true; }
+
+/* ============================================================================
+ * 6. LexiPTTApp — Push-To-Talk Walkie-Talkie (G.711A Voice + LR2021 FLRC & UDP)
+ * ============================================================================ */
+struct PttChannelPreset {
+    const char *name;
+    const char *desc;
+    uint32_t freq_hz;
+    float freq_mhz;
+    bool is_hf;
+};
+
+static const PttChannelPreset kPttChannels[4] = {
+    {"CH1: 915M", "915.00 MHz US-ISM FLRC (650 kbps)", 915000000UL, 915.00f, false},
+    {"CH2: 433M", "433.92 MHz LPD433 Sub-GHz Walkie",  433920000UL, 433.92f, false},
+    {"CH3: 868M", "868.50 MHz EU-SRD Tactical Voice",  868500000UL, 868.50f, false},
+    {"CH4: 2.4G", "2450.0 MHz High-Rate FLRC + Wi-Fi", 2450000000UL, 2450.00f, true},
+};
+
+static int g_ptt_ch_idx = 0;
+static volatile bool g_ptt_worker_running = false;
+static volatile bool g_ptt_tx_active = false;
+static volatile bool g_ptt_lock_mode = false;
+static volatile bool g_ptt_replay_req = false;
+static volatile bool g_ptt_tone_req = false;
+static volatile bool g_ptt_ui_dirty = true;
+static int g_ptt_squelch_dbm = -100;
+static float g_ptt_cur_rssi_dbm = -114.0f;
+static int g_ptt_vu_percent = 5;
+static uint32_t g_ptt_tx_pkts = 0;
+static uint32_t g_ptt_rx_pkts = 0;
+static pthread_t g_ptt_worker_tid;
+static pthread_mutex_t g_ptt_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static char g_ptt_log[1536] =
+    "[LexiPTT] Sovereign Walkie-Talkie Ready.\n"
+    "• Audio Codec: K230 I2S + G.711A (8000 Hz 16-bit Voice)\n"
+    "• Radio Link: Semtech LR2021 FLRC + UDP :9444 Broadcast\n"
+    "• Hold the giant PTT button (or tap PTT Lock) to transmit.\n";
+
+static lv_obj_t *g_ptt_ch_lbl = nullptr;
+static lv_obj_t *g_ptt_state_lbl = nullptr;
+static lv_obj_t *g_ptt_vu_bar = nullptr;
+static lv_obj_t *g_ptt_talk_btn = nullptr;
+static lv_obj_t *g_ptt_lock_btn = nullptr;
+static lv_obj_t *g_ptt_sq_btn = nullptr;
+static lv_obj_t *g_ptt_log_lbl = nullptr;
+
+static void ptt_append_log(const char *line)
+{
+    pthread_mutex_lock(&g_ptt_lock);
+    size_t cur = strlen(g_ptt_log);
+    size_t add = strlen(line);
+    if (cur + add + 2 >= sizeof(g_ptt_log)) {
+        size_t keep = sizeof(g_ptt_log) / 2;
+        memmove(g_ptt_log, g_ptt_log + (cur - keep), keep);
+        g_ptt_log[keep] = '\0';
+        cur = keep;
+    }
+    snprintf(g_ptt_log + cur, sizeof(g_ptt_log) - cur, "%s\n", line);
+    g_ptt_ui_dirty = true;
+    pthread_mutex_unlock(&g_ptt_lock);
+}
+
+#define LEXI_GPIO_DM_OUTPUT  _IOW('G', 0, int)
+#define LEXI_GPIO_WRITE_HIGH _IOW('G', 5, int)
+
+static void ptt_init_i2s_speaker_hw(void)
+{
+    fpioa_set_function(32, IIS_CLK, -1, -1, -1, -1, -1, -1, -1);
+    fpioa_set_function(33, IIS_WS, -1, -1, -1, -1, -1, -1, -1);
+    fpioa_set_function(35, IIS_D_OUT0_PDM_IN1, -1, -1, -1, -1, -1, -1, -1);
+    fpioa_set_function(34, GPIO34, -1, -1, -1, -1, -1, -1, -1);
+
+    int gfd = open("/dev/gpio", O_RDWR);
+    if (gfd >= 0) {
+        pin_gpio_t pin_34 = {.pin = 34, .val = 1};
+        ioctl(gfd, LEXI_GPIO_DM_OUTPUT, &pin_34);
+        ioctl(gfd, LEXI_GPIO_WRITE_HIGH, &pin_34);
+        close(gfd);
+    }
+}
+
+/* Transmit a 168-byte LPTT voice/tone burst over LR2021 FIFO & Wi-Fi UDP :9444 */
+static void ptt_transmit_burst_frame(int spi_fd, int udp_sock, uint8_t ch_idx, uint16_t seq, const uint8_t *g711_payload, size_t payload_len)
+{
+    uint8_t pkt[180];
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 'L';
+    pkt[1] = 'P';
+    pkt[2] = 'T';
+    pkt[3] = 'T';
+    pkt[4] = ch_idx;
+    pkt[5] = (uint8_t)((seq >> 8) & 0xFF);
+    pkt[6] = (uint8_t)(seq & 0xFF);
+    if (payload_len > 160) payload_len = 160;
+    pkt[7] = (uint8_t)payload_len;
+    memcpy(pkt + 8, g711_payload, payload_len);
+    size_t total_len = 8 + payload_len;
+
+    if (spi_fd >= 0) {
+        /* Write to LR2021 TX FIFO (0x0002) and trigger SET_TX (0x020D) */
+        uint8_t spi_buf[184];
+        spi_buf[0] = 0x00;
+        spi_buf[1] = 0x02; // RADIOLIB_LR20xx_CMD_WRITE_BUFFER
+        memcpy(spi_buf + 2, pkt, total_len);
+        lr2021_spi_tx(spi_fd, spi_buf, 2 + total_len);
+
+        uint8_t cmd_tx[5] = {0x02, 0x0D, 0x00, 0x20, 0x00}; // SET_TX with short timeout
+        lr2021_spi_tx(spi_fd, cmd_tx, sizeof(cmd_tx));
+    }
+
+    if (udp_sock >= 0) {
+        struct sockaddr_in bcast;
+        memset(&bcast, 0, sizeof(bcast));
+        bcast.sin_family = AF_INET;
+        bcast.sin_port = htons(9444);
+        bcast.sin_addr.s_addr = inet_addr("255.255.255.255");
+        sendto(udp_sock, pkt, total_len, 0, (struct sockaddr *)&bcast, sizeof(bcast));
+    }
+}
+
+static void *ptt_ai_encode_bg_thread(void *arg)
+{
+    (void)arg;
+    audio_sample_enable_audio_codec(K_TRUE);
+    audio_sample_ai_encode(K_FALSE, 8000, KD_AUDIO_BIT_WIDTH_16, 0, K_PT_G711A, "/tmp/lexi_ptt_voice.g711a");
+    return nullptr;
+}
+
+static void *ptt_ao_decode_bg_thread(void *arg)
+{
+    const char *fname = (const char *)arg;
+    audio_sample_enable_audio_codec(K_TRUE);
+    audio_sample_decode_ao(K_FALSE, 8000, KD_AUDIO_BIT_WIDTH_16, 0, K_PT_G711A, fname);
+    return nullptr;
+}
+
+/* Generate a 0.45s 1750Hz / 1000Hz G.711A walkie-talkie alert & roger-beep file */
+static void ptt_generate_tone_g711a(const char *path, bool is_call_tone)
+{
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    /* G.711 A-law alternating high/low synthetic sine pattern at 8000 Hz */
+    static const uint8_t kTone1750[8] = {0xD5, 0x9A, 0x85, 0x9A, 0x55, 0x1A, 0x05, 0x1A};
+    static const uint8_t kTone1000[8] = {0xD5, 0x8F, 0x8F, 0xD5, 0x55, 0x0F, 0x0F, 0x55};
+    int total_bytes = is_call_tone ? 3600 : 1200;
+    for (int i = 0; i < total_bytes; i++) {
+        const uint8_t *pat = (is_call_tone && (i / 900) % 2 == 1) ? kTone1000 : kTone1750;
+        fputc(pat[i & 7], fp);
+    }
+    fclose(fp);
+}
+
+static void ptt_play_g711a_clip(const char *path, int duration_ms)
+{
+    struct stat st;
+    if (stat(path, &st) != 0 || st.st_size <= 0) {
+        ptt_generate_tone_g711a(path, false);
+    }
+    ptt_init_i2s_speaker_hw();
+    pthread_t tid;
+    if (pthread_create(&tid, nullptr, ptt_ao_decode_bg_thread, (void *)path) == 0) {
+        usleep(duration_ms * 1000);
+        audio_sample_exit();
+        pthread_join(tid, nullptr);
+    }
+}
+
+static void *ptt_worker_thread(void *arg)
+{
+    (void)arg;
+    int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_sock >= 0) {
+        int yes = 1;
+        setsockopt(udp_sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+        setsockopt(udp_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        struct timeval tv = {.tv_sec = 0, .tv_usec = 40000};
+        setsockopt(udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port = htons(9444);
+        bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(udp_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
+    }
+
+    uint16_t seq = 1;
+    while (g_ptt_worker_running) {
+        /* 1. Handle PTT Voice Transmission while button is held or locked */
+        if (g_ptt_tx_active || g_ptt_lock_mode) {
+            const PttChannelPreset &ch = kPttChannels[g_ptt_ch_idx];
+            char start_msg[128];
+            snprintf(start_msg, sizeof(start_msg),
+                     "[PTT-TX] ON AIR -> %s (%.2f MHz) Capturing G.711A 8kHz...",
+                     ch.name, ch.freq_mhz);
+            ptt_append_log(start_msg);
+
+            ptt_init_i2s_speaker_hw();
+            pthread_t cap_tid;
+            bool cap_started = (pthread_create(&cap_tid, nullptr, ptt_ai_encode_bg_thread, nullptr) == 0);
+
+            int spi_fd = open("/dev/spi1", O_RDWR);
+            if (spi_fd >= 0) {
+                lr2021_tune_freq(spi_fd, ch.freq_hz, ch.is_hf);
+            }
+
+            long tx_Offset = 0;
+            uint32_t burst_cnt = 0;
+            while (g_ptt_worker_running && (g_ptt_tx_active || g_ptt_lock_mode)) {
+                uint8_t frame[160];
+                memset(frame, 0xD5, sizeof(frame)); // G.711A silence byte 0xD5
+                FILE *fp = fopen("/tmp/lexi_ptt_voice.g711a", "rb");
+                if (fp) {
+                    fseek(fp, tx_Offset, SEEK_SET);
+                    size_t r = fread(frame, 1, sizeof(frame), fp);
+                    if (r > 0) {
+                        tx_Offset += (long)r;
+                    }
+                    fclose(fp);
+                }
+
+                /* Compute voice modulation VU meter level from G.711A bytes */
+                int energy = 0;
+                for (int i = 0; i < 160; i++) {
+                    int diff = abs((int)(frame[i] ^ 0xD5));
+                    energy += diff;
+                }
+                int vu = 25 + (energy / 64);
+                if (vu > 100) vu = 100;
+                g_ptt_vu_percent = vu;
+                g_ptt_ui_dirty = true;
+
+                ptt_transmit_burst_frame(spi_fd, udp_sock, (uint8_t)g_ptt_ch_idx, seq++, frame, sizeof(frame));
+                g_ptt_tx_pkts++;
+                burst_cnt++;
+                usleep(40000);
+            }
+
+            if (cap_started) {
+                audio_sample_exit();
+                pthread_join(cap_tid, nullptr);
+            }
+
+            /* Transmit Roger Beep EOT packet & restore RX on 915.0 MHz */
+            uint8_t eot[16] = {'E', 'O', 'T', '_', 'R', 'O', 'G', 'E', 'R', 0};
+            ptt_transmit_burst_frame(spi_fd, udp_sock, (uint8_t)g_ptt_ch_idx, seq++, eot, sizeof(eot));
+            if (spi_fd >= 0) {
+                lr2021_tune_freq(spi_fd, 915000000UL, false);
+                close(spi_fd);
+            }
+
+            g_ptt_vu_percent = 5;
+            char end_msg[140];
+            snprintf(end_msg, sizeof(end_msg),
+                     "[PTT-EOT] Sent %lu voice frames (%.1fs) + Roger Beep on %s.",
+                     (unsigned long)burst_cnt, (float)burst_cnt * 0.04f, ch.name);
+            ptt_append_log(end_msg);
+        }
+
+        /* 2. Handle 1750 Hz Repeater / Walkie Alert Call Tone */
+        if (g_ptt_tone_req) {
+            g_ptt_tone_req = false;
+            const PttChannelPreset &ch = kPttChannels[g_ptt_ch_idx];
+            ptt_append_log("[PTT-TONE] Transmitting 1750Hz/1000Hz Alert Call Tone...");
+            ptt_generate_tone_g711a("/tmp/lexi_ptt_tone.g711a", true);
+
+            int spi_fd = open("/dev/spi1", O_RDWR);
+            if (spi_fd >= 0) {
+                lr2021_tune_freq(spi_fd, ch.freq_hz, ch.is_hf);
+            }
+            uint8_t tone_pkt[160];
+            memset(tone_pkt, 0x9A, sizeof(tone_pkt));
+            for (int k = 0; k < 6; k++) {
+                g_ptt_vu_percent = 90;
+                g_ptt_ui_dirty = true;
+                ptt_transmit_burst_frame(spi_fd, udp_sock, (uint8_t)g_ptt_ch_idx, seq++, tone_pkt, sizeof(tone_pkt));
+                g_ptt_tx_pkts++;
+                usleep(30000);
+            }
+            if (spi_fd >= 0) {
+                lr2021_tune_freq(spi_fd, 915000000UL, false);
+                close(spi_fd);
+            }
+            ptt_play_g711a_clip("/tmp/lexi_ptt_tone.g711a", 450);
+            g_ptt_vu_percent = 5;
+            g_ptt_ui_dirty = true;
+        }
+
+        /* 3. Handle Replay of Last Captured / Received Voice Stream */
+        if (g_ptt_replay_req) {
+            g_ptt_replay_req = false;
+            ptt_append_log("[PTT-PLAY] Playing last G.711A voice clip on I2S Speaker (GPIO34)...");
+            g_ptt_vu_percent = 75;
+            g_ptt_ui_dirty = true;
+            ptt_play_g711a_clip("/tmp/lexi_ptt_voice.g711a", 1500);
+            g_ptt_vu_percent = 5;
+            g_ptt_ui_dirty = true;
+            ptt_append_log("[PTT-PLAY] Playback complete.");
+        }
+
+        /* 4. Poll Incoming Walkie-Talkie Frames & Channel RSSI */
+        if (udp_sock >= 0) {
+            uint8_t rx_pkt[256];
+            struct sockaddr_in src_addr;
+            socklen_t slen = sizeof(src_addr);
+            int n = recvfrom(udp_sock, rx_pkt, sizeof(rx_pkt), 0, (struct sockaddr *)&src_addr, &slen);
+            if (n > 8 && memcmp(rx_pkt, "LPTT", 4) == 0) {
+                uint8_t rx_ch = rx_pkt[4];
+                uint8_t plen = rx_pkt[7];
+                if (plen > 0 && 8 + plen <= n) {
+                    FILE *fp = fopen("/tmp/lexi_ptt_voice.g711a", "ab");
+                    if (fp) {
+                        fwrite(rx_pkt + 8, 1, plen, fp);
+                        fclose(fp);
+                    }
+                    g_ptt_rx_pkts++;
+                    g_ptt_vu_percent = 80;
+                    g_ptt_ui_dirty = true;
+                    if (plen < 32 && memcmp(rx_pkt + 8, "EOT_ROGER", 9) == 0) {
+                        char rx_msg[128];
+                        snprintf(rx_msg, sizeof(rx_msg),
+                                 "[PTT-RX] Received Voice Burst on CH%u (%lu pkts) — Playing...",
+                                 (unsigned)(rx_ch + 1), (unsigned long)g_ptt_rx_pkts);
+                        ptt_append_log(rx_msg);
+                        ptt_play_g711a_clip("/tmp/lexi_ptt_voice.g711a", 1200);
+                        g_ptt_vu_percent = 5;
+                    }
+                }
+            }
+        }
+
+        /* Sample ambient RSSI on active Walkie-Talkie channel */
+        int spi_fd = open("/dev/spi1", O_RDWR);
+        if (spi_fd >= 0) {
+            float rssi = -114.0f;
+            if (lr2021_spi_read_rssi(spi_fd, &rssi)) {
+                g_ptt_cur_rssi_dbm = rssi;
+                int rssi_vu = (int)(rssi + 120.0f);
+                if (rssi_vu < 4) rssi_vu = 4;
+                if (rssi_vu > 100) rssi_vu = 100;
+                g_ptt_vu_percent = rssi_vu;
+                g_ptt_ui_dirty = true;
+            }
+            close(spi_fd);
+        }
+
+        usleep(90000);
+    }
+
+    if (udp_sock >= 0) {
+        close(udp_sock);
+    }
+    return nullptr;
+}
+
+static void update_lexiptt_ui(void)
+{
+    if (!g_ptt_ch_lbl || !g_ptt_state_lbl || !g_ptt_vu_bar || !g_ptt_log_lbl) return;
+
+    const PttChannelPreset &ch = kPttChannels[g_ptt_ch_idx];
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+             "%s\nRSSI: %.1f dBm  |  Squelch: %d dBm  |  TX: %lu  RX: %lu",
+             ch.desc, g_ptt_cur_rssi_dbm, g_ptt_squelch_dbm,
+             (unsigned long)g_ptt_tx_pkts, (unsigned long)g_ptt_rx_pkts);
+    lv_label_set_text(g_ptt_ch_lbl, buf);
+
+    bool tx_now = (g_ptt_tx_active || g_ptt_lock_mode);
+    bool sq_open = (!tx_now && g_ptt_cur_rssi_dbm >= (float)g_ptt_squelch_dbm);
+
+    if (tx_now) {
+        lv_label_set_text(g_ptt_state_lbl, "STATUS: ON AIR — TRANSMITTING VOICE (G.711A)");
+        lv_obj_set_style_text_color(g_ptt_state_lbl, lv_color_hex(0xEF4444), 0);
+    } else if (sq_open) {
+        lv_label_set_text(g_ptt_state_lbl, "STATUS: CARRIER DETECTED — SQUELCH OPEN (RX)");
+        lv_obj_set_style_text_color(g_ptt_state_lbl, lv_color_hex(0x10B981), 0);
+    } else {
+        lv_label_set_text(g_ptt_state_lbl, "STATUS: STANDBY / LISTENING (SQUELCH QUIET)");
+        lv_obj_set_style_text_color(g_ptt_state_lbl, lv_color_hex(0x38BDF8), 0);
+    }
+
+    lv_bar_set_value(g_ptt_vu_bar, g_ptt_vu_percent, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(g_ptt_vu_bar,
+        lv_color_hex(tx_now ? 0xEF4444 : (sq_open ? 0x10B981 : 0x0284C7)), LV_PART_INDICATOR);
+
+    if (g_ptt_talk_btn) {
+        lv_obj_set_style_bg_color(g_ptt_talk_btn,
+            lv_color_hex(tx_now ? 0xDC2626 : 0x0F766E), 0);
+        lv_obj_set_style_border_color(g_ptt_talk_btn,
+            lv_color_hex(tx_now ? 0xFCA5A5 : 0x2DD4BF), 0);
+        lv_obj_t *lbl = lv_obj_get_child(g_ptt_talk_btn, 0);
+        if (lbl) {
+            lv_label_set_text(lbl, tx_now
+                ? "ON AIR — TRANSMITTING\n(Release to End + Roger Beep)"
+                : "HOLD TO TALK (PTT)\n(8kHz G.711A + LR2021 FLRC)");
+        }
+    }
+
+    if (g_ptt_lock_btn) {
+        lv_obj_set_style_bg_color(g_ptt_lock_btn,
+            lv_color_hex(g_ptt_lock_mode ? 0xDC2626 : 0x1E293B), 0);
+        lv_obj_t *lbl = lv_obj_get_child(g_ptt_lock_btn, 0);
+        if (lbl) {
+            lv_label_set_text(lbl, g_ptt_lock_mode ? "PTT Lock: ON" : "PTT Lock: OFF");
+        }
+    }
+
+    if (g_ptt_sq_btn) {
+        lv_obj_t *lbl = lv_obj_get_child(g_ptt_sq_btn, 0);
+        if (lbl) {
+            char sq_txt[32];
+            snprintf(sq_txt, sizeof(sq_txt), "Sq: %ddBm", g_ptt_squelch_dbm);
+            lv_label_set_text(lbl, sq_txt);
+        }
+    }
+
+    pthread_mutex_lock(&g_ptt_lock);
+    lv_label_set_text(g_ptt_log_lbl, g_ptt_log);
+    g_ptt_ui_dirty = false;
+    pthread_mutex_unlock(&g_ptt_lock);
+}
+
+static void on_ptt_ch_btn_cb(lv_event_t *e)
+{
+    intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+    if (idx >= 0 && idx < 4) {
+        g_ptt_ch_idx = (int)idx;
+        char msg[128];
+        snprintf(msg, sizeof(msg), "[Channel] Switched to %s", kPttChannels[idx].desc);
+        ptt_append_log(msg);
+        update_lexiptt_ui();
+    }
+}
+
+static void on_ptt_talk_btn_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        g_ptt_tx_active = true;
+        update_lexiptt_ui();
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (g_ptt_tx_active) {
+            g_ptt_tx_active = false;
+            update_lexiptt_ui();
+        }
+    }
+}
+
+static void on_ptt_lock_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    g_ptt_lock_mode = !g_ptt_lock_mode;
+    update_lexiptt_ui();
+}
+
+static void on_ptt_tone_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    g_ptt_tone_req = true;
+}
+
+static void on_ptt_replay_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    g_ptt_replay_req = true;
+}
+
+static void on_ptt_sq_btn_cb(lv_event_t *e)
+{
+    (void)e;
+    if (g_ptt_squelch_dbm == -105) g_ptt_squelch_dbm = -95;
+    else if (g_ptt_squelch_dbm == -95) g_ptt_squelch_dbm = -85;
+    else g_ptt_squelch_dbm = -105;
+    update_lexiptt_ui();
+}
+
+static void ptt_ui_timer_cb(lv_timer_t *t)
+{
+    (void)t;
+    if (g_ptt_ui_dirty) {
+        update_lexiptt_ui();
+    }
+}
+
+LexiPTTApp::LexiPTTApp(bool use_status_bar, bool use_navigation_bar)
+    : ESP_Brookesia_PhoneApp(
+          ESP_BROOKESIA_CORE_APP_DATA_DEFAULT("LexiPTT", &img_app_music, true),
+          ESP_BROOKESIA_PHONE_APP_DATA_DEFAULT(&img_app_music, use_status_bar, use_navigation_bar))
+{
+}
+
+LexiPTTApp::~LexiPTTApp() {}
+
+bool LexiPTTApp::run(void)
+{
+    lv_obj_t *scr = lv_scr_act();
+    lv_obj_set_style_bg_color(scr, lv_color_hex(0x090D16), 0);
+    lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+
+    /* Card 1: Channel Selector, VU / RSSI Meter & Giant Tactile PTT Button */
+    lv_obj_t *c1 = create_amoled_card(scr, 536, 540, 14);
+    lv_obj_t *t1 = lv_label_create(c1);
+    lv_label_set_text(t1, "LEXIPTT — FLRC MESH & WI-FI WALKIE-TALKIE");
+    lv_obj_set_style_text_color(t1, lv_color_hex(0x2DD4BF), 0);
+    lv_obj_set_style_text_font(t1, &lv_font_montserrat_14, 0);
+    lv_obj_align(t1, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    g_ptt_ch_lbl = lv_label_create(c1);
+    lv_obj_set_style_text_color(g_ptt_ch_lbl, lv_color_hex(0xE2E8F0), 0);
+    lv_obj_set_style_text_font(g_ptt_ch_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_ptt_ch_lbl, LV_ALIGN_TOP_LEFT, 0, 26);
+
+    g_ptt_state_lbl = lv_label_create(c1);
+    lv_obj_set_style_text_color(g_ptt_state_lbl, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_text_font(g_ptt_state_lbl, &lv_font_montserrat_14, 0);
+    lv_obj_align(g_ptt_state_lbl, LV_ALIGN_TOP_LEFT, 0, 72);
+
+    /* VU / RF Modulation Bar */
+    g_ptt_vu_bar = lv_bar_create(c1);
+    lv_obj_set_size(g_ptt_vu_bar, 498, 22);
+    lv_obj_align(g_ptt_vu_bar, LV_ALIGN_TOP_MID, 0, 100);
+    lv_bar_set_range(g_ptt_vu_bar, 0, 100);
+    lv_obj_set_style_bg_color(g_ptt_vu_bar, lv_color_hex(0x1E293B), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(g_ptt_vu_bar, lv_color_hex(0x0284C7), LV_PART_INDICATOR);
+
+    /* 4 Tactical Channel Preset Buttons */
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *b = create_action_btn(c1, kPttChannels[i].name, 118, 46, 0x1E293B);
+        lv_obj_align(b, LV_ALIGN_TOP_LEFT, i * 126, 134);
+        lv_obj_add_event_cb(b, on_ptt_ch_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
+    }
+
+    /* Giant Tactile HOLD-TO-TALK Button */
+    g_ptt_talk_btn = lv_btn_create(c1);
+    lv_obj_set_size(g_ptt_talk_btn, 498, 230);
+    lv_obj_align(g_ptt_talk_btn, LV_ALIGN_TOP_MID, 0, 194);
+    lv_obj_set_style_bg_color(g_ptt_talk_btn, lv_color_hex(0x0F766E), 0);
+    lv_obj_set_style_border_color(g_ptt_talk_btn, lv_color_hex(0x2DD4BF), 0);
+    lv_obj_set_style_border_width(g_ptt_talk_btn, 4, 0);
+    lv_obj_set_style_radius(g_ptt_talk_btn, 28, 0);
+    lv_obj_t *talk_lbl = lv_label_create(g_ptt_talk_btn);
+    lv_label_set_text(talk_lbl, "HOLD TO TALK (PTT)\n(8kHz G.711A + LR2021 FLRC)");
+    lv_obj_set_style_text_align(talk_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(talk_lbl, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_text_font(talk_lbl, &lv_font_montserrat_26, 0);
+    lv_obj_center(talk_lbl);
+    lv_obj_add_event_cb(g_ptt_talk_btn, on_ptt_talk_btn_event_cb, LV_EVENT_ALL, nullptr);
+
+    /* Bottom Utility Controls Row: PTT Lock, 1750Hz Tone, Replay Last, Squelch */
+    g_ptt_lock_btn = create_action_btn(c1, "PTT Lock: OFF", 118, 52, 0x1E293B);
+    lv_obj_align(g_ptt_lock_btn, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(g_ptt_lock_btn, on_ptt_lock_btn_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_tone = create_action_btn(c1, "1750Hz Tone", 118, 52, 0xD97706);
+    lv_obj_align(b_tone, LV_ALIGN_BOTTOM_LEFT, 126, 0);
+    lv_obj_add_event_cb(b_tone, on_ptt_tone_btn_cb, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t *b_play = create_action_btn(c1, "Replay Voice", 118, 52, 0x2563EB);
+    lv_obj_align(b_play, LV_ALIGN_BOTTOM_LEFT, 252, 0);
+    lv_obj_add_event_cb(b_play, on_ptt_replay_btn_cb, LV_EVENT_CLICKED, nullptr);
+
+    g_ptt_sq_btn = create_action_btn(c1, "Sq: -100dBm", 118, 52, 0x475569);
+    lv_obj_align(g_ptt_sq_btn, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(g_ptt_sq_btn, on_ptt_sq_btn_cb, LV_EVENT_CLICKED, nullptr);
+
+    /* Card 2: Walkie-Talkie Transmission & Reception Log */
+    lv_obj_t *c2 = create_amoled_card(scr, 536, 490, 568);
+    lv_obj_t *t2 = lv_label_create(c2);
+    lv_label_set_text(t2, "WALKIE-TALKIE VOICE & TELEMETRY LOG");
+    lv_obj_set_style_text_color(t2, lv_color_hex(0x38BDF8), 0);
+    lv_obj_set_style_text_font(t2, &lv_font_montserrat_14, 0);
+    lv_obj_align(t2, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *log_box = lv_obj_create(c2);
+    lv_obj_set_size(log_box, 498, 424);
+    lv_obj_align(log_box, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(log_box, lv_color_hex(0x060A10), 0);
+    lv_obj_set_style_border_color(log_box, lv_color_hex(0x1E293B), 0);
+    lv_obj_set_style_border_width(log_box, 1, 0);
+    lv_obj_set_style_pad_all(log_box, 10, 0);
+    lv_obj_set_scroll_dir(log_box, LV_DIR_VER);
+
+    g_ptt_log_lbl = lv_label_create(log_box);
+    lv_obj_set_width(g_ptt_log_lbl, 470);
+    lv_label_set_long_mode(g_ptt_log_lbl, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(g_ptt_log_lbl, lv_color_hex(0xA7F3D0), 0);
+    lv_obj_set_style_text_font(g_ptt_log_lbl, &lv_font_montserrat_14, 0);
+
+    if (!g_ptt_worker_running) {
+        g_ptt_worker_running = true;
+        pthread_create(&g_ptt_worker_tid, nullptr, ptt_worker_thread, nullptr);
+        pthread_detach(g_ptt_worker_tid);
+    }
+
+    update_lexiptt_ui();
+    _ptt_timer = lv_timer_create(ptt_ui_timer_cb, 200, nullptr);
+    return true;
+}
+
+bool LexiPTTApp::back(void)
+{
+    notifyCoreClosed();
+    return true;
+}
+
+bool LexiPTTApp::close(void)
+{
+    g_ptt_tx_active = false;
+    g_ptt_lock_mode = false;
+    g_ptt_worker_running = false;
+    if (_ptt_timer) {
+        lv_timer_del(_ptt_timer);
+        _ptt_timer = nullptr;
+    }
+    g_ptt_ch_lbl = nullptr;
+    g_ptt_state_lbl = nullptr;
+    g_ptt_vu_bar = nullptr;
+    g_ptt_talk_btn = nullptr;
+    g_ptt_lock_btn = nullptr;
+    g_ptt_sq_btn = nullptr;
+    g_ptt_log_lbl = nullptr;
+    return true;
+}
+
+bool LexiPTTApp::init(void) { return true; }

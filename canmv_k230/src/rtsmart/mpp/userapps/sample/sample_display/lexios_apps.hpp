@@ -36,6 +36,10 @@ uint64_t lexios_get_uptime_sec(void);
 bool lexios_get_nrf9151_power(void);
 void lexios_set_nrf9151_power(bool enable);
 
+/* Wi-Fi (802.11b/g/n) & Bluetooth 5.0 LE (GPIO45 + UART1) Power API */
+bool lexios_get_wifi_ble_power(void);
+void lexios_set_wifi_ble_power(bool enable);
+
 #ifdef __cplusplus
 }
 
@@ -84,7 +88,37 @@ private:
     lv_timer_t *_sat_timer = nullptr;
 };
 
-/* 4. LexiApps: MMU Process Supervisor & .wasm / .elf App Sandbox Runner */
+/* 4. LexiRF: Multi-Band Sub-GHz/2.4GHz Spectrum Analyzer & Wi-Fi/BLE/Cell Security Auditor */
+class LexiRFApp : public ESP_Brookesia_PhoneApp {
+public:
+    LexiRFApp(bool use_status_bar = true, bool use_navigation_bar = true);
+    ~LexiRFApp() override;
+
+    bool run(void) override;
+    bool back(void) override;
+    bool close(void) override;
+    bool init(void) override;
+
+private:
+    lv_timer_t *_rf_timer = nullptr;
+};
+
+/* 5. LexiPTT: Push-To-Talk Walkie-Talkie (G.711A Voice Codec + LR2021 FLRC & UDP Multicast) */
+class LexiPTTApp : public ESP_Brookesia_PhoneApp {
+public:
+    LexiPTTApp(bool use_status_bar = true, bool use_navigation_bar = true);
+    ~LexiPTTApp() override;
+
+    bool run(void) override;
+    bool back(void) override;
+    bool close(void) override;
+    bool init(void) override;
+
+private:
+    lv_timer_t *_ptt_timer = nullptr;
+};
+
+/* 6. LexiApps: MMU Process Supervisor & .wasm / .elf App Sandbox Runner */
 class LexiAppsApp : public ESP_Brookesia_PhoneApp {
 public:
     LexiAppsApp(bool use_status_bar = true, bool use_navigation_bar = true);
